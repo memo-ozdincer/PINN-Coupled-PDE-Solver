@@ -1,0 +1,229 @@
+"""
+Ultra-efficient data loading and target extraction using PyTorch CUDA.
+Vectorized operations throughout - no loops.
+"""
+import numpy as np
+import torch
+import pandas as pd
+from pathlib import Path
+from config import COLNAMES, V_GRID, RANDOM_SEED
+
+# ============================================================================
+# TARGET EXTRACTION - Fully vectorized on GPU
+# ============================================================================
+
+def extract_targets_gpu(iv_curves: torch.Tensor, v_grid: torch.Tensor) -> dict[str, torch.Tensor]:
+    """
+    Extract all PV parameters from J-V curves in a single vectorized pass.
+
+    Args:
+        iv_curves: (N, 45) tensor of current density values on GPU
+        v_grid: (45,) tensor of voltage values on GPU
+
+    Returns:
+        Dictionary with Voc, Jsc, Vmpp, Jmpp, FF, Pmpp, PCE tensors
+    """
+    N = iv_curves.shape[0]
+
+    # J_sc: Current at V=0 (first point)
+    Jsc = iv_curves[:, 0]
+
+    # Power curve: P = V * J
+    power = v_grid.unsqueeze(0) * iv_curves  # (N, 45)
+
+    # V_mpp, J_mpp, P_mpp: Maximum power point
+    Pmpp, mpp_idx = power.max(dim=1)
+    Vmpp = v_grid[mpp_idx]
+    Jmpp = iv_curves[torch.arange(N, device=iv_curves.device), mpp_idx]
+
+    # V_oc: Voltage where J crosses zero (linear interpolation)
+    # Find the crossing point: J changes sign from positive to negative
+    Voc = _find_voc_vectorized(iv_curves, v_grid)
+
+    # Fill Factor: FF = Pmpp / (Voc * Jsc)
+    FF = Pmpp / (Voc * Jsc + 1e-12)
+    FF = FF.clamp(0.0, 1.0)
+
+    # PCE: Assuming 1000 W/m² illumination
+    PCE = Pmpp / 1000.0
+
+    return {
+        'Voc': Voc,
+        'Jsc': Jsc,
+        'Vmpp': Vmpp,
+        'Jmpp': Jmpp,
+        'FF': FF,
+        'Pmpp': Pmpp,
+        'PCE': PCE
+    }
+
+
+def _find_voc_vectorized(iv_curves: torch.Tensor, v_grid: torch.Tensor) -> torch.Tensor:
+    """
+    Find V_oc using vectorized linear interpolation.
+    V_oc is where current crosses zero (J goes from positive to negative).
+    """
+    N = iv_curves.shape[0]
+    n_pts = iv_curves.shape[1]
+    device = iv_curves.device
+
+    # Sign change detection: positive to negative or zero crossing
+    signs = torch.sign(iv_curves)
+    sign_changes = (signs[:, :-1] > 0) & (signs[:, 1:] <= 0)
+
+    # Find first crossing index for each curve
+    # If no crossing found, use last point
+    has_crossing = sign_changes.any(dim=1)
+    first_crossing_idx = torch.where(
+        has_crossing,
+        sign_changes.int().argmax(dim=1),
+        torch.full((N,), n_pts - 2, device=device, dtype=torch.long)
+    )
+
+    # Gather values for linear interpolation
+    idx = first_crossing_idx
+    idx_next = (idx + 1).clamp(max=n_pts - 1)
+
+    batch_idx = torch.arange(N, device=device)
+    J0 = iv_curves[batch_idx, idx]
+    J1 = iv_curves[batch_idx, idx_next]
+    V0 = v_grid[idx]
+    V1 = v_grid[idx_next]
+
+    # Linear interpolation: V_oc = V0 + (0 - J0) * (V1 - V0) / (J1 - J0)
+    dJ = J1 - J0
+    dJ = torch.where(dJ.abs() < 1e-12, torch.ones_like(dJ) * 1e-12, dJ)
+    Voc = V0 - J0 * (V1 - V0) / dJ
+
+    # Clamp to valid range
+    Voc = Voc.clamp(v_grid[0], v_grid[-1])
+
+    return Voc
+
+
+# ============================================================================
+# DATA LOADING
+# ============================================================================
+
+def load_raw_data(params_file: str, iv_file: str) -> tuple[pd.DataFrame, np.ndarray]:
+    """Load raw parameter and IV data from disk."""
+    params_df = pd.read_csv(params_file, header=None, names=COLNAMES)
+    iv_data = np.loadtxt(iv_file, delimiter=',', dtype=np.float32)
+    return params_df, iv_data
+
+
+def prepare_tensors(
+    params_df: pd.DataFrame,
+    iv_data: np.ndarray,
+    device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Convert data to GPU tensors.
+
+    Returns:
+        params: (N, 31) float32 tensor
+        iv_curves: (N, 45) float32 tensor
+        v_grid: (45,) float32 tensor
+    """
+    params = torch.from_numpy(params_df.values.astype(np.float32)).to(device)
+    iv_curves = torch.from_numpy(iv_data.astype(np.float32)).to(device)
+    v_grid = torch.from_numpy(V_GRID).to(device)
+    return params, iv_curves, v_grid
+
+
+# ============================================================================
+# DATASET CLASS FOR TRAINING
+# ============================================================================
+
+class PVDataset(torch.utils.data.Dataset):
+    """Memory-efficient dataset that keeps data on GPU."""
+
+    def __init__(
+        self,
+        params: torch.Tensor,
+        targets: dict[str, torch.Tensor],
+        features: torch.Tensor | None = None
+    ):
+        self.params = params
+        self.targets = targets
+        self.features = features
+        self.n_samples = params.shape[0]
+
+    def __len__(self) -> int:
+        return self.n_samples
+
+    def __getitem__(self, idx: int) -> tuple:
+        x = self.params[idx]
+        if self.features is not None:
+            x = torch.cat([x, self.features[idx]])
+        return x, {k: v[idx] for k, v in self.targets.items()}
+
+
+def create_dataloaders(
+    params: torch.Tensor,
+    targets: dict[str, torch.Tensor],
+    features: torch.Tensor | None = None,
+    batch_size: int = 4096,
+    val_split: float = 0.1,
+    test_split: float = 0.1
+) -> tuple:
+    """
+    Create train/val/test dataloaders with GPU-resident data.
+    Uses pin_memory=False since data is already on GPU.
+    """
+    n_samples = params.shape[0]
+    indices = torch.randperm(n_samples, generator=torch.Generator().manual_seed(RANDOM_SEED))
+
+    n_test = int(n_samples * test_split)
+    n_val = int(n_samples * val_split)
+    n_train = n_samples - n_test - n_val
+
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:n_train + n_val]
+    test_idx = indices[n_train + n_val:]
+
+    def subset_targets(t_dict, idx):
+        return {k: v[idx] for k, v in t_dict.items()}
+
+    train_ds = PVDataset(
+        params[train_idx],
+        subset_targets(targets, train_idx),
+        features[train_idx] if features is not None else None
+    )
+    val_ds = PVDataset(
+        params[val_idx],
+        subset_targets(targets, val_idx),
+        features[val_idx] if features is not None else None
+    )
+    test_ds = PVDataset(
+        params[test_idx],
+        subset_targets(targets, test_idx),
+        features[test_idx] if features is not None else None
+    )
+
+    # DataLoader with num_workers=0 since data is on GPU
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=0
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=0
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, num_workers=0
+    )
+
+    return train_loader, val_loader, test_loader, train_idx, val_idx, test_idx
+
+
+def split_indices(n_samples: int, val_split: float = 0.1, test_split: float = 0.1) -> tuple:
+    """Get train/val/test indices for consistent splitting across models."""
+    indices = np.random.default_rng(RANDOM_SEED).permutation(n_samples)
+    n_test = int(n_samples * test_split)
+    n_val = int(n_samples * val_split)
+    n_train = n_samples - n_test - n_val
+
+    return (
+        indices[:n_train],
+        indices[n_train:n_train + n_val],
+        indices[n_train + n_val:]
+    )
