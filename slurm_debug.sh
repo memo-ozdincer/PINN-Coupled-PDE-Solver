@@ -52,33 +52,33 @@ echo ""
 # ============================================================================
 
 # Option 1: Data validation only (fastest - checks for inf/nan)
-echo "Running data validation..."
+# echo "Running data validation..."
+# python debug_train.py \
+#     --params $WORK_DIR/LHS_parameters_m.txt \
+#     --iv $WORK_DIR/IV_m.txt \
+#     --device cuda \
+#     --check-data-only \
+#     --verbose
+
+# Option 2: Quick test with subset (1000 samples, all models)
+echo "Running quick test with 1000 samples..."
 python debug_train.py \
     --params $WORK_DIR/LHS_parameters_m.txt \
     --iv $WORK_DIR/IV_m.txt \
     --device cuda \
-    --check-data-only \
-    --verbose
-
-# Option 2: Quick test with subset (1000 samples, all models)
-# echo "Running quick test with 1000 samples..."
-# python debug_train.py \
-#     --params $WORK_DIR/LHS_parameters_m.txt \
-#     --iv $WORK_DIR/IV_m.txt \
-#     --device cuda \
-#     --n-samples 1000 \
-#     --all \
-#     --epochs 10 \
-#     --n-estimators 50
+    --n-samples 1000 \
+    --all \
+    --epochs 10 \
+    --n-estimators 50
 
 # Option 3: Single model test (Voc NN)
 # echo "Training Voc NN..."
-# python debug_train.py \
-#     --params $WORK_DIR/LHS_parameters_m.txt \
-#     --iv $WORK_DIR/IV_m.txt \
-#     --device cuda \
-#     --model voc_nn \
-#     --epochs 20
+python debug_train.py \
+    --params $WORK_DIR/LHS_parameters_m.txt \
+    --iv $WORK_DIR/IV_m.txt \
+    --device cuda \
+    --model voc_nn \
+    --epochs 20
 
 # Option 4: Single model test (Jsc LGBM)
 # echo "Training Jsc LGBM..."

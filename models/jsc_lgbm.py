@@ -216,10 +216,20 @@ def compute_jsc_ceiling_numpy(params: np.ndarray, col_idx: dict) -> np.ndarray:
     """
     Compute Jsc ceiling from raw parameters (numpy version).
     J_ceiling = q * G_avg * L_P
+
+    NOTE: Handles both log10 and linear scale inputs for Gavg.
     """
     Q_E = 1.602e-19
     lP_m = params[:, col_idx['lP']] * 1e-9  # nm to m
-    Gavg = 10 ** params[:, col_idx['Gavg']]  # log scale to linear
+    Gavg_raw = params[:, col_idx['Gavg']]
+
+    # Check if values are in log10 scale (typically 20-30) or linear scale (huge numbers)
+    # Use threshold of 100 to distinguish
+    if np.abs(Gavg_raw).max() < 100:
+        Gavg = 10 ** Gavg_raw  # log scale to linear
+    else:
+        Gavg = Gavg_raw  # already in linear scale
+
     return Q_E * Gavg * lP_m
 
 
