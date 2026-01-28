@@ -101,6 +101,29 @@ def _find_voc_vectorized(iv_curves: torch.Tensor, v_grid: torch.Tensor) -> torch
     return Voc
 
 
+def clamp_iv_curves_at_voc(iv_curves: torch.Tensor, v_grid: torch.Tensor) -> torch.Tensor:
+    """
+    Clamp IV curves to ensure V_oc is an endpoint and remove negative tail.
+
+    For each curve, find V_oc, then zero out values at and beyond the first
+    grid point >= V_oc. This ensures the curve only spans [0, V_oc] with
+    J(V_oc) = 0.
+    """
+    voc = _find_voc_vectorized(iv_curves, v_grid)
+    idx_cut = torch.searchsorted(v_grid, voc, right=False)
+    idx_cut = idx_cut.clamp(max=v_grid.numel() - 1)
+    v_cut = v_grid[idx_cut]
+
+    mask = v_grid.unsqueeze(0) >= v_cut.unsqueeze(1)
+    iv_curves = iv_curves.clone()
+    iv_curves = torch.where(mask, torch.zeros_like(iv_curves), iv_curves)
+
+    batch_idx = torch.arange(iv_curves.shape[0], device=iv_curves.device)
+    iv_curves[batch_idx, idx_cut] = 0.0
+
+    return iv_curves
+
+
 # ============================================================================
 # DATA LOADING
 # ============================================================================
@@ -123,6 +146,11 @@ def load_raw_data(params_file: str, iv_file: str) -> tuple[pd.DataFrame, np.ndar
         raise ValueError(
             f"Params rows ({len(params_df)}) do not match IV rows ({iv_data.shape[0]})"
         )
+
+    v_grid = torch.from_numpy(V_GRID.astype(np.float32))
+    iv_tensor = torch.from_numpy(iv_data.astype(np.float32))
+    iv_tensor = clamp_iv_curves_at_voc(iv_tensor, v_grid)
+    iv_data = iv_tensor.cpu().numpy()
 
     return params_df, iv_data
 

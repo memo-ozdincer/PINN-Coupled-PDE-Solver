@@ -85,6 +85,9 @@ NEW IN v2.0 - Monotonicity Violation Tracking:
 
 Interpolation: `pchip_interpolate_batch` implements Fritsch-Carlson PCHIP in PyTorch.
 Stitching: Curves split at Vmpp, concatenated with mask-based selection.
+Endpoint enforcement (new):
+  - After PCHIP, set J(V=0)=Jsc, set J(Vmpp)=Jmpp, and clamp J to 0 at V>=Voc
+  - This guarantees V=0→Voc endpoint behavior with no negative tail
 Tail handling: L_tail = relu(J[v>Voc]).mean() + hard clamp at inference.
 
 ================================================================================

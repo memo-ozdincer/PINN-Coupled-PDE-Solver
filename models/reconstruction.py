@@ -233,6 +233,7 @@ def reconstruct_curve(
     if clamp_voc:
         v_oc = anchors[:, 1].unsqueeze(1)
         j_curve = torch.where(v_grid.unsqueeze(0) > v_oc, torch.zeros_like(j_curve), j_curve)
+        j_curve = torch.where(v_grid.unsqueeze(0) < 0, torch.zeros_like(j_curve), j_curve)
 
     # CRITICAL: Replace any NaN values with interpolated fallback to prevent loss explosion
     if torch.isnan(j_curve).any():
@@ -242,6 +243,22 @@ def reconstruct_curve(
         v_norm = v_grid.unsqueeze(0) / (v_oc + 1e-6)
         fallback = j_sc * torch.clamp(1 - v_norm, 0, 1)
         j_curve = torch.where(torch.isnan(j_curve), fallback, j_curve)
+
+    batch_idx = torch.arange(j_curve.shape[0], device=j_curve.device)
+    j_curve[batch_idx, 0] = anchors[:, 0]
+
+    idx_vmpp = torch.searchsorted(v_grid, v_mpp, right=False)
+    idx_vmpp = idx_vmpp.clamp(max=v_grid.numel() - 1)
+    j_curve[batch_idx, idx_vmpp] = anchors[:, 3]
+
+    if clamp_voc:
+        v_oc = anchors[:, 1].unsqueeze(1)
+        idx_cut = torch.searchsorted(v_grid, v_oc, right=False)
+        idx_cut = idx_cut.clamp(max=v_grid.numel() - 1)
+        v_cut = v_grid[idx_cut]
+        mask_cut = v_grid.unsqueeze(0) >= v_cut
+        j_curve = torch.where(mask_cut, torch.zeros_like(j_curve), j_curve)
+        j_curve[batch_idx, idx_cut] = 0.0
 
     return j_curve
 
