@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
 #SBATCH --gpus-per-node=1
-#SBATCH --time=12:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/curve_recon_%j.out
 #SBATCH --error=/scratch/memoozd/ts-tools-scratch/dbe/logs/curve_recon_%j.err
 #SBATCH --account=aip-aspuru
