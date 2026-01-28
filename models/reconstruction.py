@@ -149,11 +149,12 @@ def pchip_interpolate_batch(
 ) -> torch.Tensor:
     """
     Batch PCHIP interpolation for 1D data.
+    Vectorized implementation for speed.
 
     Args:
         x_knots: (N, K) sorted knot locations
         y_knots: (N, K) knot values
-        x_eval: (M,) evaluation points (shared across batch)
+        x_eval: (M,) evaluation points (will be broadcast to (N, M))
 
     Returns:
         y_eval: (N, M) interpolated values
@@ -163,32 +164,38 @@ def pchip_interpolate_batch(
     device = x_knots.device
 
     slopes = _pchip_slopes(x_knots, y_knots)
-    y_eval = torch.empty(batch, n_eval, device=device, dtype=y_knots.dtype)
+    
+    # Expand x_eval to correlate with batch: (N, M)
+    x_eval_batch = x_eval.unsqueeze(0).expand(batch, n_eval)
+    
+    # Find indices: (N, M)
+    # searchsorted returns indices where elements should be inserted to maintain order
+    # right=False: a[i-1] < v <= a[i]
+    idx = torch.searchsorted(x_knots, x_eval_batch, right=False) - 1
+    
+    # Clamp to valid segment indices [0, k-2]
+    idx = idx.clamp(0, k - 2)
+    
+    # Gather values for the corresponding segments
+    # All gathered tensors will be (N, M)
+    x0 = torch.gather(x_knots, 1, idx)
+    x1 = torch.gather(x_knots, 1, idx + 1)
+    y0 = torch.gather(y_knots, 1, idx)
+    y1 = torch.gather(y_knots, 1, idx + 1)
+    d0 = torch.gather(slopes, 1, idx)
+    d1 = torch.gather(slopes, 1, idx + 1)
 
-    for i in range(batch):
-        xi = x_knots[i]
-        yi = y_knots[i]
-        di = slopes[i]
+    # Perform interpolation
+    h = x1 - x0
+    # Add epsilon to handle cases where h=0 (though knots should be distinct)
+    t = (x_eval_batch - x0) / (h + 1e-12)
 
-        idx = torch.bucketize(x_eval, xi) - 1
-        idx = idx.clamp(0, k - 2)
+    h00 = (1 + 2 * t) * (1 - t) ** 2
+    h10 = t * (1 - t) ** 2
+    h01 = t ** 2 * (3 - 2 * t)
+    h11 = t ** 2 * (t - 1)
 
-        x0 = xi[idx]
-        x1 = xi[idx + 1]
-        h = x1 - x0
-        t = (x_eval - x0) / (h + 1e-12)
-
-        y0 = yi[idx]
-        y1 = yi[idx + 1]
-        d0 = di[idx]
-        d1 = di[idx + 1]
-
-        h00 = (1 + 2 * t) * (1 - t) ** 2
-        h10 = t * (1 - t) ** 2
-        h01 = t ** 2 * (3 - 2 * t)
-        h11 = t ** 2 * (t - 1)
-
-        y_eval[i] = h00 * y0 + h10 * h * d0 + h01 * y1 + h11 * h * d1
+    y_eval = h00 * y0 + h10 * h * d0 + h01 * y1 + h11 * h * d1
 
     return y_eval
 
