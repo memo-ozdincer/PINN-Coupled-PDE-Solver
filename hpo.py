@@ -47,43 +47,50 @@ class HPOConfig:
 # ============================================================================
 
 def sample_voc_nn_config(trial: optuna.Trial, input_dim: int) -> VocNNConfig:
-    """Sample hyperparameters for Voc neural network - simplified architecture to prevent overfitting."""
+    """
+    Sample hyperparameters for Voc neural network.
 
-    # Architecture - SHALLOW and focused to match data complexity
-    # Deep networks overfit on limited data; LGBM achieves R²>0.97 with same features
-    n_layers = trial.suggest_int('n_layers', 2, 5)  # Shallow networks
+    SIMPLIFIED for robustness:
+    - Narrower search ranges based on physics intuition
+    - Favor simpler architectures that generalize
+    - Lower learning rates for stability
+    """
+
+    # Architecture - SIMPLE and focused
+    # 2-3 layers are usually sufficient for this problem
+    n_layers = trial.suggest_int('n_layers', 2, 3)
     hidden_dims = []
     for i in range(n_layers):
-        # Moderate sizes - start wide, taper down
-        dim = trial.suggest_categorical(f'hidden_{i}', [64, 128, 256, 512])
+        # Tapering architecture: wide -> narrow
+        if i == 0:
+            dim = trial.suggest_categorical(f'hidden_{i}', [128, 256])
+        else:
+            dim = trial.suggest_categorical(f'hidden_{i}', [64, 128])
         hidden_dims.append(dim)
 
     return VocNNConfig(
         input_dim=input_dim,
         hidden_dims=hidden_dims,
 
-        # Regularization - moderate to balance fitting and generalization
-        dropout=trial.suggest_float('dropout', 0.05, 0.3),  # Standard dropout range
-        use_layer_norm=trial.suggest_categorical('use_layer_norm', [True, False]),
-        use_residual=trial.suggest_categorical('use_residual', [True, False]),  # Optional for shallow nets
+        # Regularization - stronger to prevent overfitting
+        dropout=trial.suggest_float('dropout', 0.1, 0.25),
+        use_layer_norm=True,  # Always use for stability
+        use_residual=trial.suggest_categorical('use_residual', [True, False]),
 
-        # Activation - focus on smooth activations
-        activation=trial.suggest_categorical(
-            'activation', ['gelu', 'silu', 'mish']  # Removed leaky_relu
-        ),
+        # Activation - GELU is usually best for smooth problems
+        activation=trial.suggest_categorical('activation', ['gelu', 'silu']),
 
-        # Physics losses - MEANINGFUL WEIGHTS for actual guidance
-        # These need to be comparable to MSE loss to have impact
-        jacobian_weight=trial.suggest_float('jacobian_weight', 1e-4, 0.1, log=True),  # Smoothness regularization
-        physics_weight=trial.suggest_float('physics_weight', 1e-3, 0.5, log=True),    # Physical ceiling constraint
+        # Physics losses - narrower range, known to work
+        jacobian_weight=trial.suggest_float('jacobian_weight', 1e-3, 0.05, log=True),
+        physics_weight=trial.suggest_float('physics_weight', 0.01, 0.1, log=True),
 
-        # Optimizer - wider LR range and stronger regularization
-        lr=trial.suggest_float('lr', 1e-6, 5e-3, log=True),  # Lower minimum LR
-        weight_decay=trial.suggest_float('weight_decay', 1e-8, 1e-4, log=True),
+        # Optimizer - LOWER learning rates for stability
+        lr=trial.suggest_float('lr', 5e-5, 1e-3, log=True),
+        weight_decay=trial.suggest_float('weight_decay', 1e-6, 1e-4, log=True),
 
-        # Training - longer training for convergence
-        epochs=trial.suggest_int('epochs', 100, 500),  # Longer training
-        patience=trial.suggest_int('patience', 20, 50),  # More patience
+        # Training - reasonable epochs with good patience
+        epochs=trial.suggest_int('epochs', 150, 300),
+        patience=trial.suggest_int('patience', 25, 40),
         use_amp=True,
     )
 
@@ -196,52 +203,50 @@ class VocNNObjective:
 def sample_lgbm_config(trial: optuna.Trial, model_type: str = 'jsc') -> dict:
     """
     Sample hyperparameters for LightGBM.
-    Very wide search space - we have the compute for it.
+
+    SIMPLIFIED for robustness:
+    - Use GBDT only (DART is slower and rarely better)
+    - Narrower ranges based on what typically works
+    - Lower learning rates for stability
     """
     params = {
         'objective': 'regression',
         'metric': ['rmse', 'mae'],
-        'boosting_type': trial.suggest_categorical('boosting_type', ['gbdt', 'dart']),
+        'boosting_type': 'gbdt',  # GBDT is faster and usually sufficient
         'device': 'gpu',
         'gpu_platform_id': 0,
         'gpu_device_id': 0,
         'verbose': -1,
         'force_col_wise': True,
 
-        # Tree structure - allow very complex trees
-        'num_leaves': trial.suggest_int('num_leaves', 31, 1024),
-        'max_depth': trial.suggest_int('max_depth', 5, 25),
-        'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
-        'min_child_weight': trial.suggest_float('min_child_weight', 1e-4, 10, log=True),
+        # Tree structure - moderate complexity
+        'num_leaves': trial.suggest_int('num_leaves', 31, 255),
+        'max_depth': trial.suggest_int('max_depth', 6, 15),
+        'min_child_samples': trial.suggest_int('min_child_samples', 10, 50),
+        'min_child_weight': trial.suggest_float('min_child_weight', 1e-3, 1.0, log=True),
 
-        # Learning rate and iterations
-        'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.3, log=True),
-        'n_estimators': trial.suggest_int('n_estimators', 500, 5000),
+        # Learning rate and iterations - LOWER LR for stability
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+        'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
 
-        # Sampling
-        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-        'subsample_freq': trial.suggest_int('subsample_freq', 1, 10),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        # Sampling - moderate ranges
+        'subsample': trial.suggest_float('subsample', 0.7, 0.95),
+        'subsample_freq': trial.suggest_int('subsample_freq', 1, 5),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 0.95),
 
-        # Regularization
-        'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
-        'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
-        'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 1.0),
+        # Regularization - moderate L1/L2
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-4, 1.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-4, 1.0, log=True),
+        'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 0.1),
 
-        # Feature fraction
-        'feature_fraction': trial.suggest_float('feature_fraction', 0.5, 1.0),
-        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.5, 1.0),
-        'bagging_freq': trial.suggest_int('bagging_freq', 1, 10),
+        # Feature/bagging fraction
+        'feature_fraction': trial.suggest_float('feature_fraction', 0.7, 0.95),
+        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 0.95),
+        'bagging_freq': trial.suggest_int('bagging_freq', 1, 5),
 
-        # Path smoothing (DART specific)
-        'path_smooth': trial.suggest_float('path_smooth', 0.0, 1.0),
+        # Path smoothing
+        'path_smooth': trial.suggest_float('path_smooth', 0.0, 0.5),
     }
-
-    # DART specific parameters
-    if params['boosting_type'] == 'dart':
-        params['drop_rate'] = trial.suggest_float('drop_rate', 0.0, 0.5)
-        params['max_drop'] = trial.suggest_int('max_drop', 10, 100)
-        params['skip_drop'] = trial.suggest_float('skip_drop', 0.0, 0.8)
 
     return params
 
@@ -502,7 +507,34 @@ def run_full_hpo(
     )
     results['vmpp_lgbm'] = {'params': vmpp_params, 'study': vmpp_study}
 
-    # 4. FF LGBM
+    # 4. Jmpp LGBM (was missing - now added)
+    print("=" * 60)
+    print("HPO: Jmpp LGBM")
+    print("=" * 60)
+    X_train_jmpp = np.hstack([
+        X_train_raw, X_train_physics,
+        targets_train['Jsc'].reshape(-1, 1),
+        np.log10(np.abs(targets_train['Jsc']) + 1e-30).reshape(-1, 1),
+        targets_train['Vmpp'].reshape(-1, 1),
+        np.log10(targets_train['Vmpp'] + 1e-30).reshape(-1, 1)
+    ])
+    X_val_jmpp = np.hstack([
+        X_val_raw, X_val_physics,
+        targets_val['Jsc'].reshape(-1, 1),
+        np.log10(np.abs(targets_val['Jsc']) + 1e-30).reshape(-1, 1),
+        targets_val['Vmpp'].reshape(-1, 1),
+        np.log10(targets_val['Vmpp'] + 1e-30).reshape(-1, 1)
+    ])
+    # Target as Jmpp/Jsc ratio
+    y_train_jmpp = targets_train['Jmpp'] / (targets_train['Jsc'] + 1e-30)
+    y_val_jmpp = targets_val['Jmpp'] / (targets_val['Jsc'] + 1e-30)
+
+    jmpp_params, jmpp_study = engine.optimize_lgbm(
+        X_train_jmpp, y_train_jmpp, X_val_jmpp, y_val_jmpp, 'jmpp'
+    )
+    results['jmpp_lgbm'] = {'params': jmpp_params, 'study': jmpp_study}
+
+    # 5. FF LGBM
     print("=" * 60)
     print("HPO: FF LGBM")
     print("=" * 60)
@@ -578,14 +610,29 @@ def get_best_configs_from_study(results: dict) -> dict:
             reg_lambda=params.get('reg_lambda', 0.1),
         )
 
+    # Jmpp LGBM (uses VmppLGBMConfig)
+    if 'jmpp_lgbm' in results:
+        params = results['jmpp_lgbm']['params']
+        configs['jmpp_lgbm'] = VmppLGBMConfig(
+            num_leaves=params.get('num_leaves', 127),
+            max_depth=params.get('max_depth', 12),
+            learning_rate=params.get('learning_rate', 0.05),
+            n_estimators=params.get('n_estimators', 1500),
+            min_child_samples=params.get('min_child_samples', 20),
+            subsample=params.get('subsample', 0.8),
+            colsample_bytree=params.get('colsample_bytree', 0.8),
+            reg_alpha=params.get('reg_alpha', 0.1),
+            reg_lambda=params.get('reg_lambda', 0.1),
+        )
+
     # FF LGBM (uses VmppLGBMConfig)
     if 'ff_lgbm' in results:
         params = results['ff_lgbm']['params']
         configs['ff_lgbm'] = VmppLGBMConfig(
-            num_leaves=params.get('num_leaves', 255),
-            max_depth=params.get('max_depth', 15),
+            num_leaves=params.get('num_leaves', 127),
+            max_depth=params.get('max_depth', 12),
             learning_rate=params.get('learning_rate', 0.05),
-            n_estimators=params.get('n_estimators', 2000),
+            n_estimators=params.get('n_estimators', 1500),
             min_child_samples=params.get('min_child_samples', 20),
             subsample=params.get('subsample', 0.8),
             colsample_bytree=params.get('colsample_bytree', 0.8),

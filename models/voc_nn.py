@@ -9,13 +9,33 @@ from torch.cuda.amp import autocast, GradScaler
 from dataclasses import dataclass
 
 
-def physics_projection(raw_outputs: torch.Tensor) -> torch.Tensor:
+def physics_projection(raw_outputs: torch.Tensor, return_violations: bool = False) -> torch.Tensor:
     """
     Hard projection for physical constraints on anchors.
 
     Input shape: (N, 4) with [Jsc, Voc, Vmpp, Jmpp]
     Output shape: (N, 4) with constraints enforced.
+
+    Args:
+        raw_outputs: Raw network outputs before projection
+        return_violations: If True, also return violation counts dict
+
+    Returns:
+        projected: Tensor with constraints enforced
+        violations: (optional) Dict with violation counts if return_violations=True
     """
+    # Count violations BEFORE projection (for logging)
+    violations = None
+    if return_violations:
+        violations = {
+            'jsc_negative': (raw_outputs[:, 0] < 1e-6).sum().item(),
+            'voc_negative': (raw_outputs[:, 1] < 1e-6).sum().item(),
+            'vmpp_exceeds_voc': (raw_outputs[:, 2] >= raw_outputs[:, 1]).sum().item(),
+            'jmpp_exceeds_jsc': (raw_outputs[:, 3] >= raw_outputs[:, 0]).sum().item(),
+            'total_samples': raw_outputs.shape[0]
+        }
+
+    # Apply hard constraints
     j_sc = torch.clamp(raw_outputs[:, 0], min=1e-6)
     v_oc = torch.clamp(raw_outputs[:, 1], min=1e-6)
     v_mpp = torch.clamp(raw_outputs[:, 2], min=1e-6)
@@ -27,7 +47,11 @@ def physics_projection(raw_outputs: torch.Tensor) -> torch.Tensor:
     v_mpp = torch.minimum(v_mpp, v_mpp_max)
     j_mpp = torch.minimum(j_mpp, j_mpp_max)
 
-    return torch.stack([j_sc, v_oc, v_mpp, j_mpp], dim=1)
+    projected = torch.stack([j_sc, v_oc, v_mpp, j_mpp], dim=1)
+
+    if return_violations:
+        return projected, violations
+    return projected
 
 
 @dataclass
@@ -462,12 +486,35 @@ class UnifiedSplitSplineNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_violations: bool = False
+    ):
+        """
+        Forward pass with optional constraint violation logging.
+
+        Args:
+            x: Input features (N, input_dim)
+            return_violations: If True, also return constraint violation counts
+
+        Returns:
+            anchors, ctrl1, ctrl2, (violations if return_violations)
+        """
         features = self.backbone(x)
         anchors_raw = self.head_anchors(features)
-        anchors = physics_projection(anchors_raw)
+
+        violations = None
+        if return_violations:
+            anchors, violations = physics_projection(anchors_raw, return_violations=True)
+        else:
+            anchors = physics_projection(anchors_raw)
+
         ctrl1 = self.head_region1(features)
         ctrl2 = self.head_region2(features)
+
+        if return_violations:
+            return anchors, ctrl1, ctrl2, violations
         return anchors, ctrl1, ctrl2
 
 

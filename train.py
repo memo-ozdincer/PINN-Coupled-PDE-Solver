@@ -36,13 +36,25 @@ from models.vmpp_lgbm import (
 )
 from models.reconstruction import reconstruct_curve, continuity_loss
 from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study
+from logging_utils import (
+    TrainingLogger, ModelComparisonMetrics,
+    compute_multicollinearity, suggest_features_to_drop
+)
 
 
 class MultiTaskLoss(nn.Module):
-    """Automatic loss weighting for anchors + curve reconstruction."""
+    """
+    Automatic loss weighting for anchors + curve reconstruction.
+    Uses Kendall's multi-task learning with learned log-variances.
+
+    Logs sigma values to detect task imbalance:
+    - If sigma_anchor << sigma_curve: anchor task is "easy", curve task is "hard"
+    - If sigma_curve << sigma_anchor: curve task is "easy", anchor task is "hard"
+    """
 
     def __init__(self):
         super().__init__()
+        # Initialize log_sigma = 0 -> sigma = 1.0 (balanced start)
         self.log_sigma_anchor = nn.Parameter(torch.zeros(1))
         self.log_sigma_curve = nn.Parameter(torch.zeros(1))
 
@@ -59,16 +71,24 @@ class MultiTaskLoss(nn.Module):
         sigma_a = torch.exp(self.log_sigma_anchor)
         sigma_c = torch.exp(self.log_sigma_curve)
 
+        # Kendall multi-task loss formula
         loss = (
             l_anchor / (2 * sigma_a ** 2) + torch.log(sigma_a) +
             l_curve / (2 * sigma_c ** 2) + torch.log(sigma_c)
         )
 
+        # Compute task imbalance indicator
+        # Ratio > 10 or < 0.1 indicates significant imbalance
+        sigma_ratio = (sigma_a / (sigma_c + 1e-8)).item()
+
         metrics = {
-            'anchor': l_anchor.item(),
-            'curve': l_curve.item(),
+            'loss_anchor': l_anchor.item(),
+            'loss_curve': l_curve.item(),
             'sigma_anchor': sigma_a.item(),
-            'sigma_curve': sigma_c.item()
+            'sigma_curve': sigma_c.item(),
+            'sigma_ratio': sigma_ratio,
+            'loss_total': loss.item(),
+            'task_imbalance': 'anchor_easy' if sigma_ratio < 0.1 else ('curve_easy' if sigma_ratio > 10 else 'balanced')
         }
         return loss, metrics
 
@@ -100,7 +120,15 @@ class ScalarPredictorPipeline:
         drop_weak_features: bool = False,
         weak_feature_threshold: float = 0.3,
         max_weak_feature_fraction: float = 0.2,
-        hpo_config: HPOConfig = None
+        hpo_config: HPOConfig = None,
+        # New config options for robustness and logging
+        multicollinearity_threshold: float = 0.85,
+        drop_multicollinear: bool = False,
+        continuity_weight: float = 0.1,  # Lambda_cont, try 0.1-1.0
+        ctrl_points: int = 4,  # Reduced from 6 for simplicity
+        use_hard_clamp_training: bool = True,  # Fix train-test mismatch
+        log_constraint_violations: bool = True,
+        verbose_logging: bool = True
     ):
         self.params_file = params_file
         self.iv_file = iv_file
@@ -117,6 +145,15 @@ class ScalarPredictorPipeline:
         self.max_weak_feature_fraction = max_weak_feature_fraction
         self.hpo_config = hpo_config or HPOConfig()
 
+        # New config options
+        self.multicollinearity_threshold = multicollinearity_threshold
+        self.drop_multicollinear = drop_multicollinear
+        self.continuity_weight = continuity_weight
+        self.ctrl_points = ctrl_points
+        self.use_hard_clamp_training = use_hard_clamp_training
+        self.log_constraint_violations = log_constraint_violations
+        self.verbose_logging = verbose_logging
+
         # Will be populated during pipeline
         self.params_df = None
         self.iv_data = None
@@ -128,9 +165,19 @@ class ScalarPredictorPipeline:
         self.physics_feature_names = get_feature_names()
         self.v_grid = V_GRID.astype(np.float32)
 
+        # Initialize structured logger
+        self.logger = TrainingLogger(self.output_dir, verbose=verbose_logging)
+
         print(f"Device: {self.device}")
         if self.device.type == 'cuda':
             print(f"GPU: {torch.cuda.get_device_name()}")
+
+        # Log configuration
+        print(f"\nPipeline Configuration:")
+        print(f"  continuity_weight: {continuity_weight}")
+        print(f"  ctrl_points: {ctrl_points}")
+        print(f"  use_hard_clamp_training: {use_hard_clamp_training}")
+        print(f"  multicollinearity_threshold: {multicollinearity_threshold}")
 
     def load_data(self):
         """Load raw data from files."""
@@ -243,6 +290,48 @@ class ScalarPredictorPipeline:
                 self._apply_feature_mask(weak_indices)
             else:
                 print("WARNING: Weak features detected. Consider dropping them for robustness.")
+
+        # Multicollinearity check (CRITICAL for feature redundancy)
+        print("\n" + "=" * 60)
+        print("Checking Multicollinearity")
+        print("=" * 60)
+
+        # Combine raw + physics features for full check
+        X_full = np.hstack([train['X_raw'], train['X_physics']])
+        feature_names_full = list(COLNAMES) + self.physics_feature_names
+
+        corr_matrix, high_corr_pairs = compute_multicollinearity(
+            X_full, threshold=self.multicollinearity_threshold
+        )
+
+        # Log to structured logger
+        self.logger.log_multicollinearity(
+            feature_names_full, corr_matrix, self.multicollinearity_threshold
+        )
+
+        if self.drop_multicollinear and len(high_corr_pairs) > 0:
+            # Compute target correlations for deciding which to drop
+            target_array = np.column_stack([
+                train['targets'][k] for k in ['Jsc', 'Voc', 'Vmpp', 'Jmpp', 'FF', 'PCE']
+            ])
+            target_corr = np.array([
+                max(abs(np.corrcoef(X_full[:, i], target_array[:, j])[0, 1])
+                    for j in range(target_array.shape[1]))
+                for i in range(X_full.shape[1])
+            ])
+            target_corr = np.nan_to_num(target_corr, nan=0.0)
+
+            # Only drop physics features (indices >= 31), not raw params
+            features_to_drop = suggest_features_to_drop(
+                corr_matrix, feature_names_full, target_corr, self.multicollinearity_threshold
+            )
+            # Filter to only physics features (offset by 31 raw params)
+            physics_to_drop = [i - 31 for i in features_to_drop if i >= 31]
+
+            if physics_to_drop:
+                print(f"Dropping {len(physics_to_drop)} multicollinear physics features")
+                combined_drop = list(set(weak_indices + physics_to_drop))
+                self._apply_feature_mask(combined_drop)
 
     def _apply_feature_mask(self, weak_indices: list[int]):
         """Apply a mask to remove weak physics features across all splits."""
@@ -452,7 +541,8 @@ class ScalarPredictorPipeline:
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
 
-        config = SplitSplineNetConfig(input_dim=X_train_full.shape[1])
+        # Use configurable control points (simplified from 6 to 4)
+        config = SplitSplineNetConfig(input_dim=X_train_full.shape[1], ctrl_points=self.ctrl_points)
         model = UnifiedSplitSplineNet(config).to(self.device)
         multitask_loss = MultiTaskLoss().to(self.device)
 
@@ -470,31 +560,56 @@ class ScalarPredictorPipeline:
         patience = 15
         patience_counter = 0
 
+        print(f"\nTraining curve model with:")
+        print(f"  ctrl_points: {self.ctrl_points}")
+        print(f"  continuity_weight: {self.continuity_weight}")
+        print(f"  use_hard_clamp_training: {self.use_hard_clamp_training}")
+
         for epoch in range(100):
             model.train()
             epoch_losses = []
-            for batch_x, batch_anchors, batch_curves in train_loader:
+            epoch_violations = {'jsc_negative': 0, 'voc_negative': 0, 'vmpp_exceeds_voc': 0, 'jmpp_exceeds_jsc': 0, 'total': 0}
+            cont_loss = torch.tensor(0.0)  # Initialize for logging
+
+            for batch_idx, (batch_x, batch_anchors, batch_curves) in enumerate(train_loader):
                 batch_x = batch_x.to(self.device)
                 batch_anchors = batch_anchors.to(self.device)
                 batch_curves = batch_curves.to(self.device)
 
                 optimizer.zero_grad()
-                pred_anchors, ctrl1, ctrl2 = model(batch_x)
+
+                # Get predictions with optional violation logging
+                if self.log_constraint_violations:
+                    pred_anchors, ctrl1, ctrl2, violations = model(batch_x, return_violations=True)
+                    if violations:
+                        for k in ['jsc_negative', 'voc_negative', 'vmpp_exceeds_voc', 'jmpp_exceeds_jsc']:
+                            epoch_violations[k] += violations.get(k, 0)
+                        epoch_violations['total'] += violations.get('total_samples', 0)
+                else:
+                    pred_anchors, ctrl1, ctrl2 = model(batch_x)
+
+                # CRITICAL FIX: Use same clamping in training as inference
+                # This fixes the train-test distribution shift
                 pred_curve = reconstruct_curve(
                     pred_anchors, ctrl1, ctrl2, v_grid,
-                    clamp_voc=False,
+                    clamp_voc=self.use_hard_clamp_training,  # Use hard clamp during training too
                     validate_monotonicity=not self._curve_monotonicity_checked
                 )
                 self._curve_monotonicity_checked = True
 
                 loss, metrics = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
-                loss = loss + 0.1 * continuity_loss(pred_anchors, ctrl1, ctrl2, v_grid)
 
-                # Soft penalty for J > 0 beyond Voc to avoid hard clamping discontinuity
-                v_oc = pred_anchors[:, 1].unsqueeze(1)
-                tail_mask = v_grid.unsqueeze(0) > v_oc
-                tail_penalty = (torch.relu(pred_curve) * tail_mask).mean()
-                loss = loss + 10.0 * tail_penalty
+                # Add continuity loss with configurable weight
+                cont_loss = continuity_loss(pred_anchors, ctrl1, ctrl2, v_grid)
+                loss = loss + self.continuity_weight * cont_loss
+
+                # Only add tail penalty if NOT using hard clamp (backward compat)
+                if not self.use_hard_clamp_training:
+                    v_oc = pred_anchors[:, 1].unsqueeze(1)
+                    tail_mask = v_grid.unsqueeze(0) > v_oc
+                    tail_penalty = (torch.relu(pred_curve) * tail_mask).mean()
+                    loss = loss + 10.0 * tail_penalty
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -512,14 +627,16 @@ class ScalarPredictorPipeline:
             sum_cnt_r2 = 0.0
             ff_mape_sum = 0.0
             ff_cnt = 0.0
+            val_metrics_last = {}
+
             with torch.no_grad():
                 for batch_x, batch_anchors, batch_curves in val_loader:
                     batch_x = batch_x.to(self.device)
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
                     pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                    pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=False)
-                    val_loss, _ = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
+                    pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=self.use_hard_clamp_training)
+                    val_loss, val_metrics_last = multitask_loss(pred_anchors, batch_anchors, pred_curve, batch_curves)
                     val_losses.append(val_loss.item())
 
                     err = (pred_curve - batch_curves) ** 2
@@ -544,15 +661,38 @@ class ScalarPredictorPipeline:
                     ff_cnt += ff_true.numel()
 
             avg_val = float(np.mean(val_losses))
+
+            # Log to structured logger every epoch
+            if val_metrics_last:
+                cont_loss_val = cont_loss.item() if 'cont_loss' in dir() and isinstance(cont_loss, torch.Tensor) else 0.0
+                self.logger.log_multitask_loss(
+                    epoch=epoch,
+                    loss_anchor=val_metrics_last.get('loss_anchor', 0),
+                    loss_curve=val_metrics_last.get('loss_curve', 0),
+                    sigma_anchor=val_metrics_last.get('sigma_anchor', 1.0),
+                    sigma_curve=val_metrics_last.get('sigma_curve', 1.0),
+                    loss_continuity=cont_loss_val,
+                    loss_total=avg_val
+                )
+
+            # Log constraint violations
+            if self.log_constraint_violations and epoch_violations['total'] > 0:
+                violation_rate = sum(epoch_violations[k] for k in ['jsc_negative', 'voc_negative', 'vmpp_exceeds_voc', 'jmpp_exceeds_jsc']) / (epoch_violations['total'] * 4) * 100
+                if epoch % 10 == 0:
+                    print(f"  [Constraints] Violation rate: {violation_rate:.2f}%")
+
             if epoch % 10 == 0:
                 mse_full = sum_sq_full / max(1.0, sum_cnt)
                 mse_r1 = sum_sq_r1 / max(1.0, sum_cnt_r1)
                 mse_r2 = sum_sq_r2 / max(1.0, sum_cnt_r2)
                 ff_mape = (ff_mape_sum / max(1.0, ff_cnt)) * 100
+                sigma_a = val_metrics_last.get('sigma_anchor', 1.0)
+                sigma_c = val_metrics_last.get('sigma_curve', 1.0)
                 print(
                     f"Epoch {epoch}: train_loss={np.mean(epoch_losses):.6f}, "
                     f"val_loss={avg_val:.6f}, mse_full={mse_full:.6f}, "
-                    f"mse_r1={mse_r1:.6f}, mse_r2={mse_r2:.6f}, ff_mape={ff_mape:.2f}%"
+                    f"mse_r1={mse_r1:.6f}, mse_r2={mse_r2:.6f}, ff_mape={ff_mape:.2f}%, "
+                    f"sigma_a={sigma_a:.4f}, sigma_c={sigma_c:.4f}"
                 )
 
             if avg_val < best_val:
@@ -572,6 +712,7 @@ class ScalarPredictorPipeline:
 
     def evaluate_curve_model(self, split_name: str = 'test') -> dict:
         """Evaluate the curve model with full + region-wise metrics."""
+        import time
         if 'curve_model' not in self.models:
             raise ValueError("Curve model not trained.")
 
@@ -619,6 +760,9 @@ class ScalarPredictorPipeline:
             'j_exceeds_jsc': 0
         }
 
+        # Time inference
+        start_time = time.time()
+
         with torch.no_grad():
             for batch_x, batch_anchors, batch_curves in loader:
                 batch_x = batch_x.to(self.device)
@@ -626,7 +770,7 @@ class ScalarPredictorPipeline:
                 batch_curves = batch_curves.to(self.device)
 
                 pred_anchors, ctrl1, ctrl2 = model(batch_x)
-                pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=False)
+                pred_curve = reconstruct_curve(pred_anchors, ctrl1, ctrl2, v_grid, clamp_voc=self.use_hard_clamp_training)
 
                 err = (pred_curve - batch_curves) ** 2
                 sum_sq_full += err.sum().item()
@@ -660,7 +804,10 @@ class ScalarPredictorPipeline:
                 violations['jmpp_invalid'] += ((pred_anchors[:, 3] <= 0) | (pred_anchors[:, 3] >= pred_anchors[:, 0])).sum().item()
                 violations['j_exceeds_jsc'] += (pred_curve > pred_anchors[:, 0].unsqueeze(1)).sum().item()
 
+        elapsed_time = time.time() - start_time
         n_samples = max(1, len(split['X_raw']))
+        inference_time_ms = (elapsed_time / n_samples) * 1000
+
         results = {
             'mse_full_curve': sum_sq_full / max(1.0, sum_cnt),
             'mse_region1': sum_sq_r1 / max(1.0, sum_cnt_r1),
@@ -670,8 +817,30 @@ class ScalarPredictorPipeline:
             'mae_vmpp': vmpp_mae / n_samples,
             'mae_jmpp': jmpp_mae / n_samples,
             'mape_ff': (ff_mape_sum / max(1.0, ff_cnt)) * 100,
-            'constraint_violations': violations
+            'constraint_violations': violations,
+            'inference_time_ms': inference_time_ms
         }
+
+        # Log to structured logger for comparison table
+        comparison_metrics = ModelComparisonMetrics(
+            model_name='Split-Spline',
+            mse_full_curve=results['mse_full_curve'],
+            mse_region1=results['mse_region1'],
+            mse_region2=results['mse_region2'],
+            mae_jsc=results['mae_jsc'],
+            mae_voc=results['mae_voc'],
+            mae_vmpp=results['mae_vmpp'],
+            mae_jmpp=results['mae_jmpp'],
+            mape_ff=results['mape_ff'],
+            violations_jsc_negative=violations['jsc_negative'],
+            violations_voc_negative=violations['voc_negative'],
+            violations_vmpp_invalid=violations['vmpp_invalid'],
+            violations_jmpp_invalid=violations['jmpp_invalid'],
+            violations_j_exceeds_jsc=violations['j_exceeds_jsc'],
+            inference_time_ms=inference_time_ms,
+            total_samples=n_samples
+        )
+        self.logger.log_model_comparison(comparison_metrics)
 
         print("\nCurve Model Metrics:")
         for k, v in results.items():
@@ -757,6 +926,7 @@ class ScalarPredictorPipeline:
 
     def evaluate_cvae(self, split_name: str = 'test', n_samples: int = 5) -> dict:
         """Evaluate CVAE baseline using conditional generation."""
+        import time
         if 'cvae' not in self.models:
             raise ValueError("CVAE not trained.")
 
@@ -765,10 +935,15 @@ class ScalarPredictorPipeline:
         X_full = (X_full - self.cvae_feature_mean) / self.cvae_feature_std
 
         curves_true = split['curves'].astype(np.float32)
+        anchors_true = np.stack(
+            [split['targets']['Jsc'], split['targets']['Voc'], split['targets']['Vmpp'], split['targets']['Jmpp']],
+            axis=1
+        ).astype(np.float32)
 
         ds = torch.utils.data.TensorDataset(
             torch.from_numpy(curves_true),
-            torch.from_numpy(X_full)
+            torch.from_numpy(X_full),
+            torch.from_numpy(anchors_true)
         )
         loader = torch.utils.data.DataLoader(ds, batch_size=2048)
 
@@ -778,6 +953,12 @@ class ScalarPredictorPipeline:
 
         sum_sq_full = 0.0
         sum_cnt = 0.0
+        sum_sq_r1 = 0.0
+        sum_cnt_r1 = 0.0
+        sum_sq_r2 = 0.0
+        sum_cnt_r2 = 0.0
+        ff_mape_sum = 0.0
+        ff_cnt = 0.0
         violations = {
             'jsc_negative': 0,
             'voc_negative': 0,
@@ -786,10 +967,13 @@ class ScalarPredictorPipeline:
             'j_exceeds_jsc': 0
         }
 
+        start_time = time.time()
+
         with torch.no_grad():
-            for batch_curves, batch_cond in loader:
+            for batch_curves, batch_cond, batch_anchors in loader:
                 batch_curves = batch_curves.to(self.device)
                 batch_cond = batch_cond.to(self.device)
+                batch_anchors = batch_anchors.to(self.device)
 
                 preds = []
                 for _ in range(n_samples):
@@ -801,11 +985,28 @@ class ScalarPredictorPipeline:
                 sum_sq_full += err.sum().item()
                 sum_cnt += err.numel()
 
+                # Region-wise MSE using true Vmpp
+                vmpp_true = batch_anchors[:, 2].unsqueeze(1)
+                mask_r1 = v_grid.unsqueeze(0) <= vmpp_true
+                mask_r2 = ~mask_r1
+                sum_sq_r1 += (err * mask_r1).sum().item()
+                sum_cnt_r1 += mask_r1.sum().item()
+                sum_sq_r2 += (err * mask_r2).sum().item()
+                sum_cnt_r2 += mask_r2.sum().item()
+
                 pred_targets = extract_targets_gpu(pred_curve, v_grid)
                 jsc = pred_targets['Jsc']
                 voc = pred_targets['Voc']
                 vmpp = pred_targets['Vmpp']
                 jmpp = pred_targets['Jmpp']
+
+                # FF MAPE
+                ff_pred = (vmpp * jmpp) / (jsc * voc + 1e-12)
+                ff_true = (batch_anchors[:, 2] * batch_anchors[:, 3]) / (
+                    batch_anchors[:, 0] * batch_anchors[:, 1] + 1e-12
+                )
+                ff_mape_sum += torch.abs((ff_pred - ff_true) / (ff_true + 1e-12)).sum().item()
+                ff_cnt += ff_true.numel()
 
                 violations['jsc_negative'] += (jsc < 0).sum().item()
                 violations['voc_negative'] += (voc < 0).sum().item()
@@ -813,14 +1014,43 @@ class ScalarPredictorPipeline:
                 violations['jmpp_invalid'] += ((jmpp <= 0) | (jmpp >= jsc)).sum().item()
                 violations['j_exceeds_jsc'] += (pred_curve > jsc.unsqueeze(1)).sum().item()
 
+        elapsed_time = time.time() - start_time
+        total_samples = max(1, len(split['X_raw']))
+        inference_time_ms = (elapsed_time / total_samples) * 1000
+
         results = {
             'mse_full_curve': sum_sq_full / max(1.0, sum_cnt),
-            'constraint_violations': violations
+            'mse_region1': sum_sq_r1 / max(1.0, sum_cnt_r1),
+            'mse_region2': sum_sq_r2 / max(1.0, sum_cnt_r2),
+            'mape_ff': (ff_mape_sum / max(1.0, ff_cnt)) * 100,
+            'constraint_violations': violations,
+            'inference_time_ms': inference_time_ms
         }
+
+        # Log to structured logger for comparison table
+        comparison_metrics = ModelComparisonMetrics(
+            model_name='CVAE',
+            mse_full_curve=results['mse_full_curve'],
+            mse_region1=results['mse_region1'],
+            mse_region2=results['mse_region2'],
+            mape_ff=results['mape_ff'],
+            violations_jsc_negative=violations['jsc_negative'],
+            violations_voc_negative=violations['voc_negative'],
+            violations_vmpp_invalid=violations['vmpp_invalid'],
+            violations_jmpp_invalid=violations['jmpp_invalid'],
+            violations_j_exceeds_jsc=violations['j_exceeds_jsc'],
+            inference_time_ms=inference_time_ms,
+            total_samples=total_samples
+        )
+        self.logger.log_model_comparison(comparison_metrics)
 
         print("\nCVAE Metrics:")
         print(f"  mse_full_curve: {results['mse_full_curve']}")
+        print(f"  mse_region1: {results['mse_region1']}")
+        print(f"  mse_region2: {results['mse_region2']}")
+        print(f"  mape_ff: {results['mape_ff']:.2f}%")
         print(f"  constraint_violations: {results['constraint_violations']}")
+        print(f"  inference_time_ms: {results['inference_time_ms']:.3f}")
 
         return results
 
@@ -1061,12 +1291,22 @@ class ScalarPredictorPipeline:
         self.evaluate()
         self.save_models()
 
+        # Save all structured logs
+        self.logger.save_all_logs()
+
         end_time = datetime.now()
         duration = end_time - start_time
 
         print("\n" + "=" * 60)
         print(f"Pipeline Complete! Duration: {duration}")
         print("=" * 60)
+
+        # Print comparison table if both models were trained
+        if self.logger.model_comparisons:
+            print("\n" + "=" * 60)
+            print("MODEL COMPARISON TABLE")
+            print("=" * 60)
+            print(self.logger.generate_comparison_table())
 
         return self.metrics
 
@@ -1098,6 +1338,22 @@ def main():
     parser.add_argument('--hpo-timeout', type=int, default=7200,
                         help='HPO timeout per model (seconds)')
 
+    # New options for robustness and logging
+    parser.add_argument('--multicollinearity-threshold', type=float, default=0.85,
+                        help='Threshold for multicollinearity check (default: 0.85)')
+    parser.add_argument('--drop-multicollinear', action='store_true',
+                        help='Drop multicollinear features')
+    parser.add_argument('--continuity-weight', type=float, default=0.1,
+                        help='Weight for continuity loss at Vmpp (try 0.1-1.0)')
+    parser.add_argument('--ctrl-points', type=int, default=4,
+                        help='Number of control points per region (default: 4)')
+    parser.add_argument('--soft-clamp-training', action='store_true',
+                        help='Use soft penalty instead of hard clamp during training (default: hard clamp)')
+    parser.add_argument('--no-constraint-logging', action='store_true',
+                        help='Disable constraint violation logging')
+    parser.add_argument('--quiet', action='store_true',
+                        help='Reduce logging verbosity')
+
     args = parser.parse_args()
 
     hpo_config = HPOConfig(
@@ -1116,7 +1372,15 @@ def main():
         train_cvae=args.train_cvae,
         validate_feature_correlations=not args.no_feature_validation,
         drop_weak_features=args.drop_weak_features,
-        hpo_config=hpo_config
+        hpo_config=hpo_config,
+        # New options
+        multicollinearity_threshold=args.multicollinearity_threshold,
+        drop_multicollinear=args.drop_multicollinear,
+        continuity_weight=args.continuity_weight,
+        ctrl_points=args.ctrl_points,
+        use_hard_clamp_training=not args.soft_clamp_training,
+        log_constraint_violations=not args.no_constraint_logging,
+        verbose_logging=not args.quiet
     )
 
     metrics = pipeline.run()

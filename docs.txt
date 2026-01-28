@@ -1,96 +1,433 @@
 PHYSICS-CONSTRAINED SPLIT-SPLINE J-V CURVE RECONSTRUCTION FOR PEROVSKITE SOLAR CELLS
-CONDENSED IMPLEMENTATION PLAN (AS-BUILT PIPELINE)
+CONDENSED IMPLEMENTATION PLAN (AS-BUILT PIPELINE v2.0 - ROBUST LOGGING EDITION)
 
+================================================================================
 PROBLEM STATEMENT
+================================================================================
 Objective: Predict full J-V curves (45 voltage-current pairs) for perovskite solar cells from 31 material parameters with >99.9% accuracy. Challenge: Direct MLP prediction ignores physical boundaries (J cannot exceed Jsc, V cannot exceed Voc) and produces non-monotonic artifacts at the maximum power point (MPP) "knee". Solution: Multi-head neural network that explicitly predicts physical anchors (Jsc, Voc, Vmpp, Jmpp) with hard constraint projection, then reconstructs curve shape using split PCHIP interpolation at MPP to decouple transport-limited (Region 1: 0→Vmpp) from recombination-limited physics (Region 2: Vmpp→Voc).
 
+================================================================================
 DATA & PHYSICS CONTEXT
-File: `data.py` handles loading and `config.py` defines grid/constants.
+================================================================================
+Files: `data.py` handles loading, `config.py` defines grid/constants.
 Input: 31 COMSOL-simulated material parameters (layer thicknesses, mobilities, carrier lifetimes, doping, work functions, recombination coefficients).
 Curves: 45-point J-V characteristics on non-uniform voltage grid [0, 0.1, 0.2, 0.3, 0.4, 0.425, 0.45, ..., 1.4V] totaling 45 evaluation points (`V_GRID` in `config.py`).
 Physics features: 71 engineered features computed in `features.py:compute_all_physics_features` from raw params. Includes debye_length, diffusion_length, mobility_ratios, dos_ratios, energy_differences, generation_rate, recombination_timescales, field_strengths, einstein_relations, ideality_factor_proxies, plus thermodynamic ceilings (jsc_ceiling from q×G×L, voc_ceiling from Shockley-Queisser).
-Feature validation: Pearson correlation analysis implemented (`features.py:validate_physics_features`) to drop weak features (|r|<0.3 vs targets). Masking logic is in `train.py:ScalarPredictorPipeline._apply_feature_mask`.
 
+Feature validation: Two-stage filtering implemented:
+  1. Pearson correlation analysis (`features.py:validate_physics_features`) drops weak features (|r|<0.3 vs targets)
+  2. Multicollinearity check (`logging_utils.py:compute_multicollinearity`) identifies highly correlated feature pairs (|r|>0.85)
+
+Masking logic: `train.py:ScalarPredictorPipeline._apply_feature_mask` applies both filters.
+
+================================================================================
 IMPLEMENTED ARCHITECTURE (AS-BUILT)
-File: `models/voc_nn.py`.
-UnifiedSplitSplineNet: Single end-to-end differentiable PyTorch model replacing previous scalar-only cascade (VOC NN + LightGBM). Input: 102 features (31 raw + 71 physics, normalized independently). Backbone: Shared representation [512→256→128] with BatchNorm, SiLU activation, dropout 0.15-0.2. Three parallel output heads:
-  Head A (Anchors): Predicts 4 scalars [Jsc, Voc, Vmpp, Jmpp] using `physics_projection` for hard constraints.
-  Head B (Region 1 Control): Predicts 6 normalized points (sigmoid 0-1) for curve segment 0→Vmpp (series resistance regime).
-  Head C (Region 2 Control): Predicts 6 normalized points (sigmoid 0-1) for curve segment Vmpp→Voc (recombination regime).
+================================================================================
+File: `models/voc_nn.py`
 
-HARD CONSTRAINT PROJECTION (CRITICAL REVISION FROM ORIGINAL PLAN)
-File: `models/voc_nn.py` function `physics_projection`.
-Original plan used Softplus/sigmoid activations (soft constraints allowing violations). Implemented: Differentiable clamping via torch.clamp ensuring:
+UnifiedSplitSplineNet: Single end-to-end differentiable PyTorch model.
+  Input: 102 features (31 raw + 71 physics, normalized independently)
+  Backbone: Shared representation [512→256→128] with BatchNorm, SiLU activation, dropout 0.15-0.2
+
+Three parallel output heads:
+  Head A (Anchors): Predicts 4 scalars [Jsc, Voc, Vmpp, Jmpp] using `physics_projection` for hard constraints
+  Head B (Region 1 Control): Predicts K normalized points (sigmoid 0-1) for curve segment 0→Vmpp (series resistance regime)
+  Head C (Region 2 Control): Predicts K normalized points (sigmoid 0-1) for curve segment Vmpp→Voc (recombination regime)
+
+CONFIGURABLE CONTROL POINTS (v2.0):
+  Default K=4 (reduced from 6 for simpler models)
+  Set via --ctrl-points CLI argument
+  Each region has K+2 knots total (2 anchors + K interior points)
+
+================================================================================
+HARD CONSTRAINT PROJECTION (WITH VIOLATION LOGGING)
+================================================================================
+File: `models/voc_nn.py` function `physics_projection`
+
+Implemented: Differentiable clamping via torch.clamp ensuring:
   Jsc > 1e-6 (strict positivity)
   Voc > 1e-6 (strict positivity)
   1e-6 < Vmpp < Voc - 1e-6 (strict ordering)
   1e-6 < Jmpp < Jsc - 1e-6 (strict ordering)
-Guarantees physical validity by construction at machine precision, eliminating probabilistic constraint satisfaction. Projection occurs AFTER head output, preserves gradients for backprop.
 
+NEW IN v2.0 - Violation Logging:
+  physics_projection(..., return_violations=True) returns violation counts BEFORE clamping:
+    - jsc_negative: count of Jsc < 1e-6
+    - voc_negative: count of Voc < 1e-6
+    - vmpp_exceeds_voc: count of Vmpp >= Voc
+    - jmpp_exceeds_jsc: count of Jmpp >= Jsc
+
+  This diagnoses how often the network "wants" to violate constraints during training.
+  Logged per-epoch to constraint_violations.csv via TrainingLogger.
+
+================================================================================
 SPLIT-SPLINE RECONSTRUCTION LAYER (DIFFERENTIABLE PCHIP)
-File: `models/reconstruction.py`.
-Algorithm: `build_knots` constructs monotonic voltage-current knot sequences for each region using cumulative control point scaling (revised from linear scaling to enforce monotonicity).
-Region 1: 8 knots from (V=0, J=Jsc) anchor through 6 interior points to (V=Vmpp, J=Jmpp) anchor.
-Region 2: 8 knots from (V=Vmpp, J=Jmpp) anchor through 6 interior points to (V=Voc, J=0) anchor.
-Interpolation: `pchip_interpolate_batch` in `models/reconstruction.py`. Fritsch-Carlson PCHIP (monotonic cubic) implemented in PyTorch for differentiability, guarantees no oscillations within each region.
-Stitching: Curves evaluated on v_grid, split at Vmpp, concatenated.
-Tail handling: Soft penalty L_tail = relu(J[v>Voc]).mean() with weight ≥1.0 enforces J→0 beyond Voc during training; hard clamp applied only at inference (function `reconstruct_curve(..., clamp_voc=True)`).
-Monotonicity validation: Optional checks assert j_knots[i] > j_knots[i+1] for all knots (can disable for speed).
+================================================================================
+File: `models/reconstruction.py`
 
+build_knots() constructs monotonic voltage-current knot sequences:
+  CUMULATIVE SCALING (guarantees monotonicity):
+    - ctrl values are sigmoid outputs in [0,1]
+    - cumsum gives strictly increasing sequence
+    - Normalizing by final cumsum ensures exact endpoint matching
+    - j_interior interpolates between Jsc→Jmpp (Region 1) or Jmpp→0 (Region 2)
+
+  Region 1: K+2 knots from (V=0, J=Jsc) through K interior points to (V=Vmpp, J=Jmpp)
+  Region 2: K+2 knots from (V=Vmpp, J=Jmpp) through K interior points to (V=Voc, J=0)
+
+NEW IN v2.0 - Monotonicity Violation Tracking:
+  build_knots(..., return_violation_counts=True) returns:
+    - region1_violations: samples with non-monotonic J in Region 1
+    - region2_violations: samples with non-monotonic J in Region 2
+    - total_samples: batch size
+
+  Logged to monotonicity.csv for debugging spline construction issues.
+
+Interpolation: `pchip_interpolate_batch` implements Fritsch-Carlson PCHIP in PyTorch.
+Stitching: Curves split at Vmpp, concatenated with mask-based selection.
+Tail handling: L_tail = relu(J[v>Voc]).mean() + hard clamp at inference.
+
+================================================================================
 LOSS FUNCTION (KENDALL MULTI-TASK + CONTINUITY)
-File: `train.py` class `MultiTaskLoss`.
-Original plan: Fixed weights L_total = λ1×L_anchors + λ2×L_curve (arbitrary, causes task interference). Implemented: MultiTaskLoss with learnable log-variances log_sigma_anchor, log_sigma_curve (trainable parameters). Formula: L = L_anchor/(2σ_a²) + log(σ_a) + L_curve/(2σ_c²) + log(σ_c) where L_anchor = MSE(pred_anchors, true_anchors) on 4 scalars, L_curve = MSE(reconstructed_45pts, true_45pts). Automatic balancing eliminates hyperparameter grid search; network learns optimal task weighting during training.
-Continuity regularization: `models/reconstruction.py:continuity_loss`. Additional term 0.1 × continuity_loss enforces C1 continuity (value + derivative match) at Vmpp split point using finite differences with local grid spacing: L_cont = (J1(Vmpp) - J2(Vmpp))² + (dJ1/dV|Vmpp - dJ2/dV|Vmpp)². Total loss: L_total = L_weighted + λ_cont×L_cont.
+================================================================================
+File: `train.py` class `MultiTaskLoss`
 
+Kendall multi-task learning with learnable log-variances:
+  Parameters: log_sigma_anchor, log_sigma_curve (trainable)
+  Formula: L = L_anchor/(2σ_a²) + log(σ_a) + L_curve/(2σ_c²) + log(σ_c)
+
+  L_anchor = MSE(pred_anchors, true_anchors) on 4 scalars
+  L_curve = MSE(reconstructed_curve, true_curve) on 45 points
+
+NEW IN v2.0 - Sigma Logging:
+  MultiTaskLoss tracks:
+    - sigma_anchor, sigma_curve: actual σ values (exp of log_sigma)
+    - sigma_ratio: σ_anchor / σ_curve (detect task imbalance)
+    - task_imbalance: True if ratio > 10 or < 0.1
+
+  Logged per-epoch to multitask_losses.csv.
+  Console warnings when task imbalance detected.
+
+Continuity regularization: `models/reconstruction.py:continuity_loss`
+  L_cont = (J1(Vmpp) - J2(Vmpp))² + (dJ1/dV - dJ2/dV)²
+  Weight configurable via --continuity-weight (default 0.5, try 0.1-1.0)
+
+Total loss: L_total = L_weighted + λ_cont × L_cont
+
+================================================================================
+TRAIN-TEST MISMATCH FIX (CRITICAL v2.0 CHANGE)
+================================================================================
+PROBLEM IDENTIFIED:
+  Original: Soft penalty during training, hard clamp only at inference
+  Result: Network never learns boundary behavior, performance drops at test time
+
+SOLUTION IMPLEMENTED:
+  Hard clamping (torch.clamp) now applied DURING TRAINING by default
+  Network learns correct behavior at constraint boundaries
+  No train-test distribution shift
+
+CLI Control:
+  Default: Hard clamp during training (use_hard_clamp_training=True)
+  Override: --soft-clamp-training to use soft penalties (not recommended)
+
+================================================================================
+MULTICOLLINEARITY DETECTION (NEW IN v2.0)
+================================================================================
+File: `logging_utils.py`
+
+Functions:
+  compute_multicollinearity(features, threshold=0.85):
+    Returns correlation matrix and list of highly correlated pairs
+
+  suggest_features_to_drop(corr_matrix, feature_names, target_correlations, threshold):
+    When two features are highly correlated, keeps the one with higher target correlation
+
+Integration in train.py:
+  ScalarPredictorPipeline.run_feature_validation() computes multicollinearity
+  If --drop-multicollinear flag set, removes redundant features
+  Report saved to multicollinearity.json
+
+Threshold configurable via --multicollinearity-threshold (default 0.85)
+
+================================================================================
+LOGGING INFRASTRUCTURE (NEW IN v2.0)
+================================================================================
+File: `logging_utils.py`
+
+TrainingLogger class provides centralized logging:
+
+Dataclasses for structured logging:
+  ConstraintViolationLog: epoch, batch, jsc_negative, voc_negative, vmpp_exceeds_voc, jmpp_exceeds_jsc, total_samples
+  MultiTaskLossLog: epoch, loss_anchor, loss_curve, sigma_anchor, sigma_curve, loss_continuity, loss_tail, loss_total
+  MonotonicityLog: epoch, batch, region1_violations, region2_violations, total_samples
+  ModelComparisonMetrics: model_name, mse_full_curve, mse_region1/2, mae_jsc/voc/vmpp/jmpp, mape_ff, violations_*, inference_time_ms
+
+Output files generated:
+  constraint_violations.csv   - Per-epoch constraint violation attempts
+  multitask_losses.csv        - Per-epoch sigma values and loss components
+  monotonicity.csv            - Spline knot monotonicity violations
+  multicollinearity.json      - Feature correlation analysis
+  model_comparison.json       - Split-Spline vs CVAE metrics
+  model_comparison.md         - Markdown comparison table
+  training_summary.json       - Overall training summary with duration, final sigmas, violation rates
+
+TrainingLogger.generate_comparison_table() produces formatted markdown:
+  | Model | MSE Full | MSE R1 | MSE R2 | FF MAPE (%) | Violations/1000 | Time (ms) |
+
+================================================================================
+HYPERPARAMETER OPTIMIZATION (SIMPLIFIED IN v2.0)
+================================================================================
+File: `hpo.py`
+
+SIMPLIFIED SEARCH SPACES (narrower ranges for faster convergence):
+
+VOC NN (sample_voc_nn_config):
+  - Layers: 2-3 (was 2-4)
+  - Hidden dim: 256-768 (unchanged)
+  - Learning rate: 5e-5 to 1e-3 (narrower, was 1e-5 to 1e-2)
+  - Normalization: LayerNorm always (removed BatchNorm option)
+  - Activation: gelu or silu only (removed relu, swish, mish)
+  - Dropout: 0.1-0.3 (unchanged)
+  - Weight decay: 1e-5 to 1e-2 (unchanged)
+
+LightGBM (sample_lgbm_config):
+  - Boosting: GBDT only (removed DART - too slow)
+  - Learning rate: 0.01-0.1 (narrower, was 0.005-0.2)
+  - Num leaves: 31-255 (unchanged)
+  - Max depth: 6-12 (unchanged)
+  - Feature/bagging fraction: 0.7-1.0 (unchanged)
+  - Min child samples: 5-50 (unchanged)
+
+HPO Trials (configurable):
+  --hpo-trials-nn: Default 50 (was 100)
+  --hpo-trials-lgbm: Default 100 (was 200)
+  --hpo-timeout: Default 7200 seconds (2 hours per model)
+
+FIX: Added Jmpp LGBM to run_full_hpo() (was missing)
+
+================================================================================
+CVAE BASELINE (WITH COMPARISON LOGGING)
+================================================================================
+File: `models/cvae.py`
+
+Conditional Variational Autoencoder for comparison:
+  Encoder: curve + params → latent_dim=16 via mu/logvar
+  Decoder: latent + params → reconstructed curve
+  Loss: cvae_loss = MSE_reconstruction + β×KL_divergence (β=0.001)
+
+NEW IN v2.0 - Comparison Logging:
+  evaluate_cvae() now creates ModelComparisonMetrics:
+    - mse_full_curve, mse_region1, mse_region2
+    - mae_jsc, mae_voc, mae_vmpp, mae_jmpp
+    - mape_ff
+    - violations_jsc_negative, violations_voc_negative, etc.
+    - violations_j_exceeds_jsc (J > Jsc anywhere on curve)
+    - inference_time_ms
+
+  Logged alongside Split-Spline metrics for side-by-side comparison.
+  Proves Split-Spline advantage: zero violations vs CVAE's non-zero.
+
+================================================================================
 TRAINING PIPELINE
-File: `train.py` class `ScalarPredictorPipeline`.
-Data retention: Full 45-point curves stored in splits (train/val/test dictionaries contain 'curves' key, shape (N,45)). Voltage grid v_grid (45,) stored in model checkpoint (`models/configs.json`) for inference consistency.
-Normalization: raw_params and physics_features normalized independently using per-split statistics (mean/std stored in checkpoint `models/normalization.json`). Curves remain unnormalized for loss computation.
-Training loop: `train_curve_model()` enabled via `--train-curves` flag. Optimizer: AdamW with lr 1e-3, batch size up to 4096 (GPU memory permitting). Early stopping: patience=15 on validation curve MSE. Checkpointing: Saves model_state, optimizer_state, epoch, v_grid, feature_mask (if weak features dropped), normalization stats (mean_raw, std_raw, mean_phys, std_phys). Training time: ~50-200 epochs depending on dataset size, convergence tracked via logged sigma values (check if one task dominates).
+================================================================================
+File: `train.py` class `ScalarPredictorPipeline`
 
-CVAE BASELINE (IMPLEMENTED FOR COMPARISON)
-File: `models/cvae.py`.
-Conditional Variational Autoencoder: --train-cvae flag trains comparison model. Architecture: Encoder (curve + params → latent_dim=16 via mu/logvar), Decoder (latent + params → reconstructed curve). Loss: cvae_loss = MSE_reconstruction + β×KL_divergence with β=0.001 tuned. Purpose: Demonstrate split-spline method outperforms latent-space approaches on constraint satisfaction (CVAE can produce J>Jsc, Vmpp>Voc) and FF precision. Evaluation: Same train/val/test split as split-spline model, metrics logged for comparison table (MSE, anchor MAE, FF MAPE, constraint violations).
+Constructor options (updated for v2.0):
+  - output_dir: Where to save models and logs
+  - device: 'cuda' or 'cpu'
+  - drop_weak_features: Remove features with |r| < 0.3
+  - multicollinearity_threshold: Default 0.85
+  - drop_multicollinear: Remove redundant features
+  - continuity_weight: Default 0.5 (try 0.1-1.0)
+  - ctrl_points: Default 4 (try 4-6)
+  - use_hard_clamp_training: Default True (fixes train-test mismatch)
+  - log_constraint_violations: Default True
+  - verbose_logging: Default True
 
-EVALUATION METRICS (IMPLEMENTED)
-File: `train.py` method `evaluate_curve_model` & `evaluate_cvae`.
-Full-curve MSE: Mean squared error over all 45 voltage points. Region-wise MSE: Separate error for Region 1 (v≤Vmpp_pred) and Region 2 (v>Vmpp_pred) to assess split effectiveness. Anchor precision: MAE for Jsc (mA/cm²), Voc (mV), Vmpp (mV), Jmpp (mA/cm²). Fill Factor error: MAPE(FF) where FF = (Vmpp×Jmpp)/(Voc×Jsc), most critical metric for solar cell evaluation, target <5%. Constraint violation counts: Per-batch counts of jsc<0, voc<0, vmpp invalid, jmpp invalid, J>Jsc anywhere on curve; should be zero with hard projection. Logged during validation every epoch, reported on test set at completion.
+Training flow:
+  1. Load data, compute physics features
+  2. Run feature validation (correlation + multicollinearity)
+  3. Train LightGBM models for Jsc, Vmpp, Jmpp, FF (with HPO)
+  4. Train VOC NN (with HPO)
+  5. Train UnifiedSplitSplineNet for full curve (train_curve_model)
+  6. Optionally train CVAE baseline
+  7. Evaluate all models, generate comparison table
+  8. Save all logs and checkpoints
 
-INFERENCE PIPELINE (INTEGRATED)
-File: `inference.py`.
-Command: `python inference.py --predict-curve --input params.csv --output curve_predictions.csv` (uses `slurm_curve_pipeline.sh` for HPC).
-Workflow: `ScalarPredictor` loads checkpoint containing model weights (`voc_nn.pt`, `curve_model.pt`, etc.), v_grid, feature_mask, normalization stats. Compute 71 physics features from input 31 params (apply feature mask if weak features were dropped). Normalize inputs using stored mean/std. Forward pass: anchors, ctrl1, ctrl2 = model(raw_params, physics_features). Reconstruct curve: j_curve = reconstruct_curve(anchors, ctrl1, ctrl2, v_grid).
-Uncertainty (optional --uncertainty flag): `models/voc_nn.py:predict_with_uncertainty`. MC-Dropout with n_samples=100, returns mean and std per voltage point.
-Output: CSV with columns [V0, J0, V1, J1, ..., V44, J44] and separate v_grid CSV.
+train_curve_model() loop:
+  - Hard clamping during training (if use_hard_clamp_training=True)
+  - Log sigma values and constraint violations per epoch
+  - Track monotonicity violations from build_knots
+  - Configurable continuity weight
 
-VALIDATION RESULTS (WHAT'S VERIFIED)
-Data pipeline correct, curves retained, constraints enforced, monotonicity guaranteed, continuity achieved, MSE <0.001 on val set.
-Comparison: CVAE baseline trainable and evaluable, constraint violations occur (proves split-spline advantage).
+================================================================================
+CLI ARGUMENTS (UPDATED FOR v2.0)
+================================================================================
+python train.py [options]
 
+Data options:
+  --params FILE          LHS parameters file
+  --iv FILE              IV curves file
+  --output DIR           Output directory
+
+Feature options:
+  --drop-weak-features          Drop features with weak target correlation
+  --drop-multicollinear         Drop multicollinear features
+  --multicollinearity-threshold FLOAT  Threshold for multicollinearity (default 0.85)
+
+Training options:
+  --train-curves         Train split-spline curve model
+  --train-cvae           Train CVAE baseline for comparison
+  --device DEVICE        cuda or cpu (default: cuda)
+
+Model options:
+  --ctrl-points INT      Number of control points per region (default 4)
+  --continuity-weight FLOAT  Weight for continuity loss (default 0.5)
+  --soft-clamp-training  Use soft penalties instead of hard clamp (not recommended)
+
+HPO options:
+  --hpo-trials-nn INT    HPO trials for neural networks (default 50)
+  --hpo-trials-lgbm INT  HPO trials for LightGBM (default 100)
+  --hpo-timeout INT      HPO timeout in seconds (default 7200)
+
+Logging options:
+  --no-constraint-logging  Disable constraint violation logging
+  --quiet                  Reduce console output
+
+================================================================================
+OUTPUT FILES GENERATED
+================================================================================
+After training with --train-curves --train-cvae:
+
+Models:
+  models/curve_model.pt       - UnifiedSplitSplineNet checkpoint
+  models/cvae_model.pt        - CVAE checkpoint
+  models/jsc_lgbm.pkl         - Jsc LightGBM
+  models/vmpp_lgbm.pkl        - Vmpp LightGBM
+  models/jmpp_lgbm.pkl        - Jmpp LightGBM
+  models/ff_lgbm.pkl          - FF LightGBM
+  models/voc_nn.pt            - VOC neural network
+
+Logs (new in v2.0):
+  constraint_violations.csv   - How often network tried to violate physics
+  multitask_losses.csv        - Sigma values per epoch (detect task imbalance)
+  monotonicity.csv            - Spline knot monotonicity violations
+  multicollinearity.json      - Feature correlation analysis
+  model_comparison.json       - Split-Spline vs CVAE raw metrics
+  model_comparison.md         - Formatted comparison table
+  training_summary.json       - Duration, final sigmas, overall violation rate
+
+Metrics:
+  metrics.json                - Final test set metrics
+
+================================================================================
+SLURM SCRIPT (UPDATED FOR v2.0)
+================================================================================
+File: `slurm_curve_pipeline.sh`
+
+Configuration variables:
+  HPO_TRIALS_NN=50            # Reduced due to simplified search space
+  HPO_TRIALS_LGBM=100         # Reduced due to simplified search space
+  HPO_TIMEOUT=7200            # 2 hours per model
+  CONTINUITY_WEIGHT=0.5       # Try 0.1, 0.5, or 1.0
+  CTRL_POINTS=4               # Simplified from 6
+
+Time limit: 30 hours (for unattended overnight runs)
+
+Full command:
+  python train.py \
+    --params "$WORK_DIR/LHS_parameters_m.txt" \
+    --iv "$WORK_DIR/IV_m.txt" \
+    --output "$OUT_DIR" \
+    --device cuda \
+    --train-curves \
+    --train-cvae \
+    --drop-weak-features \
+    --drop-multicollinear \
+    --hpo-trials-nn $HPO_TRIALS_NN \
+    --hpo-trials-lgbm $HPO_TRIALS_LGBM \
+    --hpo-timeout $HPO_TIMEOUT \
+    --continuity-weight $CONTINUITY_WEIGHT \
+    --ctrl-points $CTRL_POINTS
+
+================================================================================
+INFERENCE PIPELINE
+================================================================================
+File: `inference.py`
+
+Command: python inference.py --predict-curve --input params.csv --output curve_predictions.csv
+
+Workflow:
+  1. Load checkpoint (model weights, v_grid, feature_mask, normalization stats)
+  2. Compute 71 physics features from 31 input params
+  3. Apply feature mask (weak features + multicollinear features dropped)
+  4. Normalize inputs using stored mean/std
+  5. Forward pass: anchors, ctrl1, ctrl2 = model(raw_params, physics_features)
+  6. Reconstruct curve: j_curve = reconstruct_curve(anchors, ctrl1, ctrl2, v_grid, clamp_voc=True)
+
+Uncertainty (--uncertainty flag): MC-Dropout with n_samples=100
+
+================================================================================
+DEBUGGING GUIDE (NEW IN v2.0)
+================================================================================
+
+If training stalls or performs poorly, check these logs:
+
+1. SIGMA IMBALANCE (multitask_losses.csv):
+   - If sigma_anchor << sigma_curve: Anchor task too easy, network ignoring curve
+   - If sigma_curve << sigma_anchor: Curve task too easy, anchors dominating
+   - Healthy: Both sigmas in similar range (0.3-1.0)
+
+2. CONSTRAINT VIOLATIONS (constraint_violations.csv):
+   - High jsc_negative or voc_negative: Network predicting negative values
+   - High vmpp_exceeds_voc: Ordering constraint not learned
+   - Should decrease over epochs as network learns
+
+3. MONOTONICITY VIOLATIONS (monotonicity.csv):
+   - Non-zero region1_violations or region2_violations: Spline construction issues
+   - Should be zero with cumulative scaling
+
+4. MULTICOLLINEARITY (multicollinearity.json):
+   - Many high-correlation pairs: Redundant features causing instability
+   - Use --drop-multicollinear to address
+
+5. TASK IMBALANCE (console warnings):
+   - "[!] Anchor task too easy" or "[!] Curve task too easy"
+   - May need to adjust continuity weight or check data
+
+================================================================================
+VALIDATION CHECKLIST
+================================================================================
+After training, verify:
+  [ ] constraint_violations.csv shows decreasing violation rate over epochs
+  [ ] multitask_losses.csv shows balanced sigma values (ratio between 0.1-10)
+  [ ] monotonicity.csv shows zero violations
+  [ ] model_comparison.md shows Split-Spline beats CVAE on violations
+  [ ] training_summary.json shows reasonable duration and final metrics
+  [ ] metrics.json shows MSE < 0.001, FF MAPE < 5%
+
+================================================================================
 WHAT REMAINS (NEXT STEPS FOR PUBLICATION)
-Ablation studies: No-split (single spline), no-continuity, no-anchors, no-physics-features, direct-MLP baselines. Runner script needed to loop configs, train each, compile results table showing MSE/FF_MAPE/violations per ablation. Target: Demonstrate split improves FF error by ≥30% vs single spline.
-OOD evaluation: Helper `test_ood_generalization` in `train.py`. Bandgap-based extrapolation (train E_g<1.6eV, test E_g>1.8eV), leave-one-material-out if material labels exist. Requires identifying bandgap column or computing from params. Target: Show OOD error <2× interpolation error.
-Uncertainty calibration: Run MC-Dropout on test set, verify 95% prediction intervals contain true curves for 90-97% of samples (well-calibrated). Generate plots with shaded uncertainty bands.
-Automated test suite: Unit tests for constraint satisfaction, monotonicity, continuity, anchor precision, FF error. Integrate into CI/CD (GitHub Actions) for regression testing.
-Experimental validation: Acquire 10-20 experimental J-V curves from literature (NREL database, published papers), test trained model, report accuracy separately for COMSOL vs experimental. Add paper disclaimer: "Validated on COMSOL; experimental validation ongoing."
-Sensitivity analysis: Compute Jacobians ∂Jsc/∂param, ∂Voc/∂param via autograd, validate signs align with semiconductor physics, compare to CVAE Jacobians for interpretability claims.
+================================================================================
+Ablation studies: No-split, no-continuity, no-anchors, no-physics-features, direct-MLP baselines.
+OOD evaluation: Bandgap-based extrapolation, leave-one-material-out.
+Uncertainty calibration: MC-Dropout intervals, calibration plots.
+Experimental validation: NREL database curves, published J-V data.
+Sensitivity analysis: Jacobians via autograd, physics sign validation.
 
-PUBLICATION POSITIONING
-Novelty: Explicit split at MPP for PSC biphasic physics (not generic autoencoder), hard constraint projection (not soft penalties), end-to-end differentiable PCHIP (not post-hoc curve fitting), automatic loss weighting (not manual λ tuning). Advantages vs competitors: CVAE cannot guarantee J<Jsc (your method does), direct MLP ignores MPP transition (your method decouples), LightGBM cascade not end-to-end differentiable (your method is). Target metrics for acceptance: Full-curve MSE <0.001, FF MAPE <3%, zero constraint violations, OOD error ratio <2×, ablation shows split improves FF by >30%. Target journals: Solar Energy Materials & Solar Cells (domain-focused), ACS Applied Energy Materials (computational-friendly), Journal of Materials Chemistry A (ML+materials). Reviewer defense: Comparison table (split-spline vs CVAE vs direct-MLP), ablation study proving each component necessary, OOD tests showing extrapolation capability, uncertainty quantification for user trust.
-
-CURRENT STATUS SUMMARY
-Working: Hard projection, multi-head architecture, PCHIP reconstruction, Kendall loss, continuity enforcement, CVAE baseline, feature validation, curve inference, evaluation metrics.
-Validated: Data pipeline correct, curves retained, constraints enforced, monotonicity guaranteed, continuity achieved, MSE <0.001 on val set.
-Missing: Ablation runner, OOD test execution, uncertainty calibration demo, automated test suite, experimental validation.
-Timeline to publication: 3-4 weeks for ablations/OOD/uncertainty, 2 weeks for paper writing/figures, 1 week for final polishing = 6-7 weeks to submission if executed systematically.
-
+================================================================================
 KEY IMPLEMENTATION DETAILS FOR REPLICATION
-Voltage grid construction: `config.py` hardcodes `V_GRID` (45 points).
-Control point scaling: `models/reconstruction.py:build_knots` ensures monotonic decrease.
-PCHIP slopes: Fritsch-Carlson method with safe division (add 1e-8 to dx denominators) in `models/reconstruction.py`.
-Continuity finite differences: Use local spacing (v_grid[i+1]-v_grid[i-1])/2 not global step.
-Kendall initialization: log_sigma = torch.zeros(1) → σ=1.0 initially (balanced start).
-Feature mask persistence: Store boolean array in checkpoint, apply BEFORE physics computation at inference.
-Batch compatibility: All operations support batch_first convention, tested with batch_size=1 and batch_size=4096.
+================================================================================
+Voltage grid: `config.py` hardcodes `V_GRID` (45 points)
+Control points: Default K=4 per region → 6 knots total per region
+Cumulative scaling: build_knots uses cumsum for guaranteed monotonicity
+PCHIP slopes: Fritsch-Carlson with eps=1e-12 safe division
+Continuity: Finite differences with local grid spacing
+Kendall init: log_sigma = torch.zeros(1) → σ=1.0 initially
+Feature mask: Boolean array in checkpoint, applied before physics computation
+Hard clamp training: Default True, fixes train-test distribution shift
+Logging: TrainingLogger accumulates logs, saves all on completion
 
-END OF CONDENSED PLAN
+================================================================================
+END OF DOCUMENTATION (v2.0 - ROBUST LOGGING EDITION)
+================================================================================
