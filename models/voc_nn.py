@@ -36,13 +36,15 @@ def physics_projection(raw_outputs: torch.Tensor, return_violations: bool = Fals
         }
 
     # Apply hard constraints
-    j_sc = torch.clamp(raw_outputs[:, 0], min=1e-6)
-    v_oc = torch.clamp(raw_outputs[:, 1], min=1e-6)
-    v_mpp = torch.clamp(raw_outputs[:, 2], min=1e-6)
-    j_mpp = torch.clamp(raw_outputs[:, 3], min=1e-6)
+    # [FIX] Relax constraints from 1e-6 to 1e-3 to prevent slope explosion
+    margin = 1e-3
+    j_sc = torch.clamp(raw_outputs[:, 0], min=margin)
+    v_oc = torch.clamp(raw_outputs[:, 1], min=margin)
+    v_mpp = torch.clamp(raw_outputs[:, 2], min=margin)
+    j_mpp = torch.clamp(raw_outputs[:, 3], min=margin)
 
-    v_mpp_max = torch.clamp(v_oc - 1e-6, min=1e-6)
-    j_mpp_max = torch.clamp(j_sc - 1e-6, min=1e-6)
+    v_mpp_max = torch.clamp(v_oc - margin, min=margin)
+    j_mpp_max = torch.clamp(j_sc - margin, min=margin)
 
     v_mpp = torch.minimum(v_mpp, v_mpp_max)
     j_mpp = torch.minimum(j_mpp, j_mpp_max)
@@ -294,7 +296,12 @@ class VocTrainer:
 
         for batch_idx, (x, targets) in enumerate(train_loader):
             x = x.to(self.device)
-            target = targets['Voc'].to(self.device)
+            
+            # Use 'Voc' key if dict, otherwise assume tensor is the target
+            if isinstance(targets, dict):
+                target = targets['Voc'].to(self.device)
+            else:
+                target = targets.to(self.device)
 
             # Get ceiling for this batch if available
             ceiling = None
@@ -342,7 +349,12 @@ class VocTrainer:
 
         for batch_idx, (x, targets) in enumerate(val_loader):
             x = x.to(self.device)
-            target = targets['Voc'].to(self.device)
+            
+            # Use 'Voc' key if dict, otherwise assume tensor is the target
+            if isinstance(targets, dict):
+                target = targets['Voc'].to(self.device)
+            else:
+                target = targets.to(self.device)
 
             ceiling = None
             if voc_ceilings is not None:

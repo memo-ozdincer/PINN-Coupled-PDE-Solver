@@ -1199,59 +1199,13 @@ class ScalarPredictorPipeline:
 
     def _train_voc_model(self, trainer, train_loader, val_loader, config):
         """Custom training loop for Voc model."""
-        best_val_loss = float('inf')
-        patience_counter = 0
-        best_state = None
-
-        for epoch in range(config.epochs):
-            # Train
-            trainer.model.train()
-            train_losses = []
-            for batch_x, batch_y in train_loader:
-                batch_x = batch_x.to(self.device)
-                batch_y = batch_y.to(self.device)
-
-                trainer.optimizer.zero_grad()
-                pred, jac_norm = trainer.model.forward_with_jacobian(batch_x)
-                loss = torch.nn.functional.mse_loss(pred, batch_y)
-                loss = loss + config.jacobian_weight * jac_norm
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), 1.0)
-                trainer.optimizer.step()
-                train_losses.append(loss.item())
-
-            # Validate
-            trainer.model.eval()
-            val_losses = []
-            with torch.no_grad():
-                for batch_x, batch_y in val_loader:
-                    batch_x = batch_x.to(self.device)
-                    batch_y = batch_y.to(self.device)
-                    pred = trainer.model(batch_x)
-                    val_loss = torch.nn.functional.mse_loss(pred, batch_y)
-                    val_losses.append(val_loss.item())
-
-            avg_val_loss = np.mean(val_losses)
-
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}: train_loss={np.mean(train_losses):.6f}, val_loss={avg_val_loss:.6f}")
-
-            # Early stopping
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                patience_counter = 0
-                best_state = {k: v.cpu().clone() for k, v in trainer.model.state_dict().items()}
-            else:
-                patience_counter += 1
-                if patience_counter >= config.patience:
-                    print(f"Early stopping at epoch {epoch}")
-                    break
-
-            trainer.scheduler.step()
-
-        # Restore best model
-        if best_state:
-            trainer.model.load_state_dict(best_state)
+        # [FIX] Use the robust trainer.fit method instead of manual loop
+        # This ensures GradScaler, correct logging, and patience are handled properly
+        print("Starting VOC NN training via VocTrainer.fit...")
+        history = trainer.fit(train_loader, val_loader)
+        
+        best_mse = history['val'][-1]['mse'] if history['val'] else 0.0
+        print(f"Voc training complete. Best Val MSE: {best_mse:.6f}")
 
     def evaluate(self):
         """Evaluate all models on test set."""
