@@ -419,6 +419,12 @@ def run_full_hpo(
     X_train_full = np.hstack([X_train_raw, X_train_physics])
     X_val_full = np.hstack([X_val_raw, X_val_physics])
 
+    # CRITICAL: Standardize features for neural network to prevent gradient explosion
+    feature_mean = X_train_full.mean(axis=0, keepdims=True)
+    feature_std = X_train_full.std(axis=0, keepdims=True) + 1e-8
+    X_train_full = (X_train_full - feature_mean) / feature_std
+    X_val_full = (X_val_full - feature_mean) / feature_std
+
     # 1. Voc Neural Network
     print("=" * 60)
     print("HPO: Voc Neural Network")

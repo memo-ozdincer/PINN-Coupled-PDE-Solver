@@ -220,6 +220,13 @@ class ScalarPredictorPipeline:
         X_train_full = np.hstack([train['X_raw'], train['X_physics']])
         X_val_full = np.hstack([val['X_raw'], val['X_physics']])
 
+        # CRITICAL: Standardize features to prevent gradient explosion
+        # Store normalization params for inference
+        self.voc_feature_mean = X_train_full.mean(axis=0, keepdims=True)
+        self.voc_feature_std = X_train_full.std(axis=0, keepdims=True) + 1e-8
+        X_train_full = (X_train_full - self.voc_feature_mean) / self.voc_feature_std
+        X_val_full = (X_val_full - self.voc_feature_mean) / self.voc_feature_std
+
         train_ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X_train_full).float(),
             torch.from_numpy(train['targets']['Voc']).float()
@@ -447,6 +454,16 @@ class ScalarPredictorPipeline:
 
         with open(models_dir / 'configs.json', 'w') as f:
             json.dump(configs, f, indent=2, default=str)
+
+        # Save normalization parameters for Voc NN
+        if hasattr(self, 'voc_feature_mean') and hasattr(self, 'voc_feature_std'):
+            normalization_params = {
+                'voc_feature_mean': self.voc_feature_mean.tolist(),
+                'voc_feature_std': self.voc_feature_std.tolist()
+            }
+            with open(models_dir / 'normalization.json', 'w') as f:
+                json.dump(normalization_params, f)
+            print("Saved normalization parameters for Voc NN")
 
         print(f"Models saved to {models_dir}")
 

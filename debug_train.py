@@ -168,7 +168,15 @@ def train_voc_nn(data: dict, device: torch.device, epochs: int = 50,
     X_train, X_val = X_full[train_idx], X_full[val_idx]
     y_train, y_val = y[train_idx], y[val_idx]
 
+    # CRITICAL: Standardize features to prevent gradient explosion
+    # Features have huge range (-77 to 1591) which causes inf/nan without normalization
+    feature_mean = X_train.mean(axis=0, keepdims=True)
+    feature_std = X_train.std(axis=0, keepdims=True) + 1e-8  # Avoid division by zero
+    X_train = (X_train - feature_mean) / feature_std
+    X_val = (X_val - feature_mean) / feature_std
+
     print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+    print(f"Features normalized: mean={X_train.mean():.6f}, std={X_train.std():.6f}")
 
     # Create model
     config = VocNNConfig(

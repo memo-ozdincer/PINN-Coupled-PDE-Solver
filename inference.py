@@ -91,6 +91,19 @@ class ScalarPredictor:
         self.models['jmpp_lgbm'] = lgb.Booster(model_file=str(self.models_dir / 'jmpp_lgbm.txt'))
         self.models['ff_lgbm'] = lgb.Booster(model_file=str(self.models_dir / 'ff_lgbm.txt'))
 
+        # Load normalization parameters for Voc NN
+        normalization_file = self.models_dir / 'normalization.json'
+        if normalization_file.exists():
+            with open(normalization_file, 'r') as f:
+                norm_params = json.load(f)
+                self.voc_feature_mean = np.array(norm_params['voc_feature_mean'])
+                self.voc_feature_std = np.array(norm_params['voc_feature_std'])
+            print("Loaded normalization parameters for Voc NN")
+        else:
+            print("WARNING: No normalization parameters found. Predictions may be incorrect.")
+            self.voc_feature_mean = None
+            self.voc_feature_std = None
+
         print("All models loaded successfully")
 
     def predict(self, params: np.ndarray) -> PredictionResult:
@@ -119,6 +132,11 @@ class ScalarPredictor:
 
         # 1. Predict Voc
         X_full = np.hstack([params, physics_features_np])
+
+        # Apply normalization (critical for NN predictions)
+        if self.voc_feature_mean is not None and self.voc_feature_std is not None:
+            X_full = (X_full - self.voc_feature_mean) / self.voc_feature_std
+
         X_tensor = torch.from_numpy(X_full).float().to(self.device)
         voc_ceiling_tensor = torch.from_numpy(voc_ceiling).float().to(self.device)
 
