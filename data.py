@@ -109,6 +109,21 @@ def load_raw_data(params_file: str, iv_file: str) -> tuple[pd.DataFrame, np.ndar
     """Load raw parameter and IV data from disk."""
     params_df = pd.read_csv(params_file, header=None, names=COLNAMES)
     iv_data = np.loadtxt(iv_file, delimiter=',', dtype=np.float32)
+
+    # Basic shape validation to prevent downstream crashes
+    if iv_data.ndim == 1:
+        iv_data = iv_data.reshape(1, -1)
+
+    expected_cols = len(V_GRID)
+    if iv_data.shape[1] != expected_cols:
+        raise ValueError(
+            f"IV data has {iv_data.shape[1]} columns, expected {expected_cols} points matching V_GRID"
+        )
+    if len(params_df) != iv_data.shape[0]:
+        raise ValueError(
+            f"Params rows ({len(params_df)}) do not match IV rows ({iv_data.shape[0]})"
+        )
+
     return params_df, iv_data
 
 

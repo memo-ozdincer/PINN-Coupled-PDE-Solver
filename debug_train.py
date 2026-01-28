@@ -410,9 +410,8 @@ def main():
 
     if data['has_issues']:
         print("\nWARNING: Data has issues. Training may produce inf/nan values.")
-        response = input("Continue anyway? [y/N]: ")
-        if response.lower() != 'y':
-            sys.exit(1)
+        # In batch/non-interactive runs, fail fast to avoid hangs.
+        sys.exit(1)
 
     # Train models
     if args.model == 'voc_nn' or args.all:

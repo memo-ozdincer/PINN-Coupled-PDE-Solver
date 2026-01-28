@@ -384,7 +384,7 @@ class DistributedHPO:
             objective,
             n_trials=n_trials,
             timeout=self.config.timeout_per_model,
-            n_jobs=self.config.n_parallel_trials,  # Parallel trials
+            n_jobs=1,  # Avoid GPU oversubscription
             show_progress_bar=True,
             gc_after_trial=True
         )

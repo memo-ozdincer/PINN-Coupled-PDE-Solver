@@ -120,9 +120,10 @@ class ScalarPredictor:
         # 1. Predict Voc
         X_full = np.hstack([params, physics_features_np])
         X_tensor = torch.from_numpy(X_full).float().to(self.device)
+        voc_ceiling_tensor = torch.from_numpy(voc_ceiling).float().to(self.device)
 
         with torch.no_grad():
-            Voc = self.models['voc_nn'](X_tensor).cpu().numpy()
+            Voc = self.models['voc_nn'](X_tensor, voc_ceiling_tensor).cpu().numpy()
 
         # 2. Predict Jsc
         X_jsc = np.hstack([
