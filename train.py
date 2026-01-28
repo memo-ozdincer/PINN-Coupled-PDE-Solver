@@ -283,11 +283,12 @@ class ScalarPredictorPipeline:
         self.weak_features = weak_features
         weak_fraction = len(weak_indices) / max(1, train['X_physics'].shape[1])
 
+        drop_indices = []
         if len(weak_indices) > 0:
             print(f"Weak feature fraction: {weak_fraction:.2%}")
             if self.drop_weak_features or weak_fraction > self.max_weak_feature_fraction:
                 print("Dropping weak features based on correlation threshold.")
-                self._apply_feature_mask(weak_indices)
+                drop_indices.extend(weak_indices)
             else:
                 print("WARNING: Weak features detected. Consider dropping them for robustness.")
 
@@ -330,8 +331,10 @@ class ScalarPredictorPipeline:
 
             if physics_to_drop:
                 print(f"Dropping {len(physics_to_drop)} multicollinear physics features")
-                combined_drop = list(set(weak_indices + physics_to_drop))
-                self._apply_feature_mask(combined_drop)
+                drop_indices.extend(physics_to_drop)
+
+        if drop_indices:
+            self._apply_feature_mask(sorted(set(drop_indices)))
 
     def _apply_feature_mask(self, weak_indices: list[int]):
         """Apply a mask to remove weak physics features across all splits."""
