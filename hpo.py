@@ -252,7 +252,8 @@ class LGBMObjective:
         val_data = lgb.Dataset(self.X_val, label=self.y_val, reference=train_data)
 
         # Custom callback for Optuna pruning
-        pruning_callback = optuna.integration.LightGBMPruningCallback(trial, 'valid_0 rmse')
+        # Fix: Use just 'rmse' instead of 'valid_0 rmse' for newer LightGBM versions
+        pruning_callback = optuna.integration.LightGBMPruningCallback(trial, 'rmse')
 
         callbacks = [
             lgb.early_stopping(self.early_stopping_rounds),
@@ -264,6 +265,7 @@ class LGBMObjective:
             train_data,
             num_boost_round=params.pop('n_estimators'),
             valid_sets=[val_data],
+            valid_names=['valid_0'],
             callbacks=callbacks
         )
 
