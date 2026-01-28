@@ -2,7 +2,7 @@
 #SBATCH --job-name=scalar_debug
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=24
 #SBATCH --gpus-per-node=1
 #SBATCH --time=01:00:00
 #SBATCH --output=/scratch/memoozd/ts-tools-scratch/dbe/logs/scalar_debug_%j.out
