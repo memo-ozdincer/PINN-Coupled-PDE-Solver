@@ -420,12 +420,12 @@ def validate_features(features: torch.Tensor, verbose: bool = True) -> dict:
 
 def validate_physics_features(
     features: np.ndarray,
-    targets: dict | "pd.DataFrame",
-    feature_names: list[str] | None = None,
-    target_names: list[str] | None = None,
+    targets: "dict | pd.DataFrame",
+    feature_names: "list[str] | None" = None,
+    target_names: "list[str] | None" = None,
     threshold: float = 0.3,
     verbose: bool = True
-) -> tuple[list[str], list[int]]:
+) -> "tuple[list[str], list[int]]":
     """
     Empirically validate engineered features via Pearson correlation.
 
