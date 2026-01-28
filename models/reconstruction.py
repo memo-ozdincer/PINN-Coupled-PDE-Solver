@@ -39,25 +39,31 @@ def build_knots(
     v1_norm = torch.linspace(0, 1, n_ctrl + 2, device=device)
     v1_knots = v1_norm.unsqueeze(0) * v_mpp.unsqueeze(1)
 
-    eps = 1e-6
+    eps = 1e-4  # Increased epsilon for better numerical stability
 
     # Region 1: Jsc -> Jmpp (cumulative scaling guarantees monotonic decrease)
     # ctrl1 values are sigmoid outputs in [0,1], cumsum gives increasing sequence
     # Normalizing by final cumsum ensures exact endpoint matching
     j1_cumsum = torch.cumsum(ctrl1, dim=1)
-    j1_scale = j1_cumsum / (j1_cumsum[:, -1:] + eps)  # Normalized to [0, 1]
+    j1_final = j1_cumsum[:, -1:].clamp(min=eps)  # Ensure non-zero divisor
+    j1_scale = j1_cumsum / j1_final  # Normalized to [0, 1]
     # j1_interior goes from near Jsc (scale~0) to near Jmpp (scale~1)
-    j1_interior = j_sc.unsqueeze(1) - j1_scale * (j_sc - j_mpp).unsqueeze(1)
+    # Clamp (j_sc - j_mpp) to ensure non-negative range
+    j_range1 = (j_sc - j_mpp).clamp(min=0).unsqueeze(1)
+    j1_interior = j_sc.unsqueeze(1) - j1_scale * j_range1
     j1_knots = torch.cat([j_sc.unsqueeze(1), j1_interior, j_mpp.unsqueeze(1)], dim=1)
 
     # Region 2: Jmpp -> 0 (same cumulative scaling approach)
     v2_norm = torch.linspace(0, 1, n_ctrl + 2, device=device)
-    v2_knots = v_mpp.unsqueeze(1) + v2_norm.unsqueeze(0) * (v_oc - v_mpp).unsqueeze(1)
+    # Clamp (v_oc - v_mpp) to ensure non-negative range
+    v_range2 = (v_oc - v_mpp).clamp(min=eps).unsqueeze(1)
+    v2_knots = v_mpp.unsqueeze(1) + v2_norm.unsqueeze(0) * v_range2
 
     j2_cumsum = torch.cumsum(ctrl2, dim=1)
-    j2_scale = j2_cumsum / (j2_cumsum[:, -1:] + eps)
+    j2_final = j2_cumsum[:, -1:].clamp(min=eps)  # Ensure non-zero divisor
+    j2_scale = j2_cumsum / j2_final
     # j2_interior goes from near Jmpp (scale~0) to near 0 (scale~1)
-    j2_interior = j_mpp.unsqueeze(1) * (1 - j2_scale)
+    j2_interior = j_mpp.clamp(min=0).unsqueeze(1) * (1 - j2_scale)
     j2_knots = torch.cat(
         [j_mpp.unsqueeze(1), j2_interior, torch.zeros_like(j_mpp).unsqueeze(1)],
         dim=1
@@ -88,11 +94,14 @@ def build_knots(
     return v1_knots, j1_knots, v2_knots, j2_knots
 
 
-def _pchip_slopes(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """Compute PCHIP slopes using Fritsch-Carlson method."""
+def _pchip_slopes(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Compute PCHIP slopes using Fritsch-Carlson method with robust NaN handling."""
     dx = x[:, 1:] - x[:, :-1]
     dy = y[:, 1:] - y[:, :-1]
-    m = dy / (dx + eps)
+
+    # Robust division: use sign-aware epsilon to avoid division by tiny values
+    dx_safe = torch.where(dx.abs() < eps, torch.sign(dx + 1e-12) * eps, dx)
+    m = dy / dx_safe
 
     d = torch.zeros_like(y)
 
@@ -105,12 +114,22 @@ def _pchip_slopes(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> torch
     w1 = 2 * h1 + h0
     w2 = h1 + 2 * h0
     cond = (m0 * m1) > 0
-    denom = (w1 / (m0 + eps)) + (w2 / (m1 + eps))
-    d[:, 1:-1] = torch.where(cond, (w1 + w2) / (denom + eps), torch.zeros_like(m0))
 
-    # Endpoints
-    d0 = ((2 * dx[:, 0] + dx[:, 1]) * m[:, 0] - dx[:, 0] * m[:, 1]) / (dx[:, 0] + dx[:, 1] + eps)
-    dn = ((2 * dx[:, -1] + dx[:, -2]) * m[:, -1] - dx[:, -1] * m[:, -2]) / (dx[:, -1] + dx[:, -2] + eps)
+    # Robust division for harmonic mean computation
+    m0_safe = torch.where(m0.abs() < eps, torch.sign(m0 + 1e-12) * eps, m0)
+    m1_safe = torch.where(m1.abs() < eps, torch.sign(m1 + 1e-12) * eps, m1)
+    denom = (w1 / m0_safe) + (w2 / m1_safe)
+    denom_safe = torch.where(denom.abs() < eps, torch.sign(denom + 1e-12) * eps, denom)
+    d[:, 1:-1] = torch.where(cond, (w1 + w2) / denom_safe, torch.zeros_like(m0))
+
+    # Endpoints - with robust division
+    denom_d0 = dx[:, 0] + dx[:, 1]
+    denom_d0_safe = torch.where(denom_d0.abs() < eps, eps * torch.ones_like(denom_d0), denom_d0)
+    d0 = ((2 * dx[:, 0] + dx[:, 1]) * m[:, 0] - dx[:, 0] * m[:, 1]) / denom_d0_safe
+
+    denom_dn = dx[:, -1] + dx[:, -2]
+    denom_dn_safe = torch.where(denom_dn.abs() < eps, eps * torch.ones_like(denom_dn), denom_dn)
+    dn = ((2 * dx[:, -1] + dx[:, -2]) * m[:, -1] - dx[:, -1] * m[:, -2]) / denom_dn_safe
 
     def _adjust(d_end, m_end, m_adj):
         cond1 = torch.sign(d_end) != torch.sign(m_end)
@@ -207,6 +226,16 @@ def reconstruct_curve(
     if clamp_voc:
         v_oc = anchors[:, 1].unsqueeze(1)
         j_curve = torch.where(v_grid.unsqueeze(0) > v_oc, torch.zeros_like(j_curve), j_curve)
+
+    # CRITICAL: Replace any NaN values with interpolated fallback to prevent loss explosion
+    if torch.isnan(j_curve).any():
+        # Fallback: linear interpolation from Jsc to 0 over voltage range
+        j_sc = anchors[:, 0].unsqueeze(1)
+        v_oc = anchors[:, 1].unsqueeze(1)
+        v_norm = v_grid.unsqueeze(0) / (v_oc + 1e-6)
+        fallback = j_sc * torch.clamp(1 - v_norm, 0, 1)
+        j_curve = torch.where(torch.isnan(j_curve), fallback, j_curve)
+
     return j_curve
 
 

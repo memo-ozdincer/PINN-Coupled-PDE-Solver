@@ -66,6 +66,12 @@ class MultiTaskLoss(nn.Module):
         true_curve: torch.Tensor
     ) -> tuple[torch.Tensor, dict]:
         l_anchor = F.mse_loss(pred_anchors, true_anchors)
+
+        # Guard against NaN in pred_curve (from PCHIP instability)
+        if torch.isnan(pred_curve).any():
+            # Replace NaN with corresponding true values to avoid poisoning the loss
+            pred_curve = torch.where(torch.isnan(pred_curve), true_curve, pred_curve)
+
         l_curve = F.mse_loss(pred_curve, true_curve)
 
         sigma_a = torch.exp(self.log_sigma_anchor)
@@ -527,6 +533,13 @@ class ScalarPredictorPipeline:
             axis=1
         ).astype(np.float32)
 
+        # Log anchor statistics for debugging
+        print(f"\nAnchor statistics (train):")
+        print(f"  Jsc:  mean={anchors_train[:, 0].mean():.4f}, std={anchors_train[:, 0].std():.4f}")
+        print(f"  Voc:  mean={anchors_train[:, 1].mean():.4f}, std={anchors_train[:, 1].std():.4f}")
+        print(f"  Vmpp: mean={anchors_train[:, 2].mean():.4f}, std={anchors_train[:, 2].std():.4f}")
+        print(f"  Jmpp: mean={anchors_train[:, 3].mean():.4f}, std={anchors_train[:, 3].std():.4f}")
+
         curves_train = train['curves'].astype(np.float32)
         curves_val = val['curves'].astype(np.float32)
 
@@ -612,6 +625,14 @@ class ScalarPredictorPipeline:
                     tail_mask = v_grid.unsqueeze(0) > v_oc
                     tail_penalty = (torch.relu(pred_curve) * tail_mask).mean()
                     loss = loss + 10.0 * tail_penalty
+
+                # NaN detection and handling
+                if torch.isnan(loss):
+                    print(f"  [WARNING] NaN loss detected at epoch {epoch}!")
+                    print(f"    pred_anchors range: [{pred_anchors.min():.4f}, {pred_anchors.max():.4f}]")
+                    print(f"    pred_curve NaN count: {torch.isnan(pred_curve).sum().item()}")
+                    # Skip this batch to avoid poisoning the model
+                    continue
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

@@ -486,6 +486,17 @@ class UnifiedSplitSplineNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+        # Initialize anchor head biases to typical PV values
+        # This helps the model start in a physically reasonable range
+        # Typical values: Jsc~20-25, Voc~0.9-1.1, Vmpp~0.7-0.9, Jmpp~18-22
+        with torch.no_grad():
+            anchor_bias = self.head_anchors[-1].bias
+            if anchor_bias is not None:
+                anchor_bias[0] = 22.0   # Jsc
+                anchor_bias[1] = 1.0    # Voc
+                anchor_bias[2] = 0.8    # Vmpp
+                anchor_bias[3] = 20.0   # Jmpp
+
     def forward(
         self,
         x: torch.Tensor,
