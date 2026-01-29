@@ -123,10 +123,7 @@ def get_param_transformer(colnames: list[str] = None) -> ColumnTransformer:
 
         # Add log1p for material properties (they span many orders of magnitude)
         if group == 'material_properties':
-            steps.insert(
-                0,
-                ('log1p', FunctionTransformer(func=np.log1p, inverse_func=np.expm1, check_inverse=False))
-            )
+            steps.insert(0, ('log1p', FunctionTransformer(func=np.log1p, inverse_func=np.expm1)))
 
         transformers.append((group, Pipeline(steps), actual_cols))
 
@@ -166,11 +163,7 @@ class PVDataPreprocessor:
             transformed: (N, 31) transformed parameters in [-1, 1]
         """
         self.fitted = True
-        params_in = params
-        if isinstance(params, np.ndarray):
-            import pandas as pd
-            params_in = pd.DataFrame(params, columns=self.colnames)
-        return self.param_transformer.fit_transform(params_in)
+        return self.param_transformer.fit_transform(params)
 
     def transform_params(self, params: np.ndarray) -> np.ndarray:
         """
@@ -184,11 +177,7 @@ class PVDataPreprocessor:
         """
         if not self.fitted:
             raise ValueError("Must call fit_transform_params first")
-        params_in = params
-        if isinstance(params, np.ndarray):
-            import pandas as pd
-            params_in = pd.DataFrame(params, columns=self.colnames)
-        return self.param_transformer.transform(params_in)
+        return self.param_transformer.transform(params)
 
     def fit_transform_curves(self, curves: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
