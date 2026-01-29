@@ -36,7 +36,7 @@ from models.vmpp_lgbm import (
     build_vmpp_model, build_jmpp_model, build_ff_model
 )
 from models.reconstruction import (
-    reconstruct_curve, reconstruct_curve_normalized, normalize_anchors_by_isc,
+    reconstruct_curve, reconstruct_curve_normalized, normalize_anchors_by_jsc,
     continuity_loss, build_knots, pchip_interpolate_batch, linear_interpolate_batch
 )
 from models.voc_lgbm import VocLGBMConfig, build_voc_model as build_voc_lgbm_model
@@ -819,19 +819,21 @@ class ScalarPredictorPipeline:
         # Validate normalization
         validate_curve_normalization(train['curves'], curves_train_norm, isc_train, n_samples=3)
 
-        # Create datasets with normalized curves
+        # Create datasets with BOTH normalized and raw curves
+        # Loss will be computed in ABSOLUTE space to avoid normalization mismatch
+        # (targets normalized by true Isc, predictions normalized by predicted Jsc)
         train_ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X_train_norm),
             torch.from_numpy(anchors_train_norm),  # Normalized for model input
             torch.from_numpy(anchors_train),       # Raw for curve reconstruction
-            torch.from_numpy(curves_train_norm),   # Normalized curves [-1, 1]
-            torch.from_numpy(isc_train)            # For denormalization
+            torch.from_numpy(train['curves'].astype(np.float32)),  # RAW absolute curves for loss
+            torch.from_numpy(isc_train)            # For reference
         )
         val_ds = torch.utils.data.TensorDataset(
             torch.from_numpy(X_val_norm),
             torch.from_numpy(anchors_val_norm),
             torch.from_numpy(anchors_val),
-            torch.from_numpy(curves_val_norm),
+            torch.from_numpy(val['curves'].astype(np.float32)),  # RAW absolute curves for loss
             torch.from_numpy(isc_val)
         )
 
@@ -895,11 +897,11 @@ class ScalarPredictorPipeline:
             model.train()
             epoch_losses = []
 
-            for batch_x, batch_anchors_norm, batch_anchors_raw, batch_curves_norm, batch_isc in train_loader:
+            for batch_x, batch_anchors_norm, batch_anchors_raw, batch_curves_raw, batch_isc in train_loader:
                 batch_x = batch_x.to(self.device)
                 batch_anchors_norm = batch_anchors_norm.to(self.device)
                 batch_anchors_raw = batch_anchors_raw.to(self.device)
-                batch_curves_norm = batch_curves_norm.to(self.device)
+                batch_curves_raw = batch_curves_raw.to(self.device)
                 batch_isc = batch_isc.to(self.device)
 
                 optimizer.zero_grad()
@@ -907,25 +909,21 @@ class ScalarPredictorPipeline:
                 # Model predicts only control points (anchors provided as input)
                 ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
 
-                # CRITICAL FIX: Reconstruct using TRUE Isc for normalization
-                # This ensures reconstruction is in the SAME normalized space as target curves
-                # (targets are normalized by true Isc, not predicted Jsc)
+                # Reconstruct curve in normalized space, then denormalize
                 pred_curve_norm = reconstruct_curve_normalized(
-                    batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True,
-                    isc=batch_isc  # Use TRUE Isc, not predicted Jsc
+                    batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True
                 )
-                # Denormalize using TRUE Isc for absolute curve (for metrics only)
-                pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_isc)
+                pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_anchors_raw[:, 0])
 
-                # Compute loss in normalized space (better gradients)
+                # CRITICAL: Compute loss in ABSOLUTE space to avoid normalization mismatch
+                # (targets would be normalized by true Isc, predictions by predicted Jsc)
                 loss, metrics = curve_loss_fn(
-                    pred_curve_norm, batch_curves_norm, v_grid, batch_anchors_raw[:, 2]
+                    pred_curve_abs, batch_curves_raw, v_grid, batch_anchors_raw[:, 2]
                 )
 
-                # Add continuity penalty in normalized space using TRUE Isc
-                cont_loss = continuity_loss(
-                    batch_anchors_raw, ctrl1, ctrl2, v_grid, j_end=-1.0, isc=batch_isc
-                )
+                # Add continuity penalty in normalized space
+                anchors_norm = normalize_anchors_by_jsc(batch_anchors_raw)
+                cont_loss = continuity_loss(anchors_norm, ctrl1, ctrl2, v_grid, j_end=-1.0)
                 loss = loss + continuity_weight * cont_loss
 
                 if torch.isnan(loss):
@@ -951,28 +949,27 @@ class ScalarPredictorPipeline:
             ff_cnt = 0
 
             with torch.no_grad():
-                for batch_x, batch_anchors_norm, batch_anchors_raw, batch_curves_norm, batch_isc in val_loader:
+                for batch_x, batch_anchors_norm, batch_anchors_raw, batch_curves_raw, batch_isc in val_loader:
                     batch_x = batch_x.to(self.device)
                     batch_anchors_norm = batch_anchors_norm.to(self.device)
                     batch_anchors_raw = batch_anchors_raw.to(self.device)
-                    batch_curves_norm = batch_curves_norm.to(self.device)
+                    batch_curves_raw = batch_curves_raw.to(self.device)
                     batch_isc = batch_isc.to(self.device)
 
                     ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
-                    # Use TRUE Isc for reconstruction normalization (matches target space)
                     pred_curve_norm = reconstruct_curve_normalized(
-                        batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True,
-                        isc=batch_isc
+                        batch_anchors_raw, ctrl1, ctrl2, v_grid, clamp_voc=True
                     )
-                    pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_isc)
+                    pred_curve_abs = denormalize_curves_by_isc(pred_curve_norm, batch_anchors_raw[:, 0])
 
+                    # Loss in absolute space (matches training)
                     val_loss, _ = curve_loss_fn(
-                        pred_curve_norm, batch_curves_norm, v_grid, batch_anchors_raw[:, 2]
+                        pred_curve_abs, batch_curves_raw, v_grid, batch_anchors_raw[:, 2]
                     )
                     val_losses.append(val_loss.item())
 
-                    # Compute MSE in normalized space
-                    err = (pred_curve_norm - batch_curves_norm) ** 2
+                    # Compute MSE in absolute space
+                    err = (pred_curve_abs - batch_curves_raw) ** 2
                     sum_sq_full += err.sum().item()
                     sum_cnt += err.numel()
 
@@ -1125,7 +1122,7 @@ class ScalarPredictorPipeline:
         # Count how many were fixed
         n_fixed = (
             (jsc <= eps).sum() +
-            (voc <= eps).sum() + (voc > 2.0).sum() +
+            (voc <= eps).sum() + (voc > 1.4).sum() +
             (vmpp <= eps).sum() + (vmpp >= voc).sum() +
             (jmpp <= eps).sum() + (jmpp >= jsc).sum()
         )
@@ -1357,12 +1354,6 @@ class ScalarPredictorPipeline:
         curves_true = split['curves'].astype(np.float32)
         curves_true_norm = split.get('curves_norm')
 
-        # Get TRUE Isc values for proper normalization
-        isc_values = split.get('isc_values')
-        if isc_values is None:
-            # Fallback: use curves[:, 0] as Isc
-            isc_values = curves_true[:, 0]
-
         # Normalize anchors if using new model
         if use_ctrl_point_model:
             anchors_pred = self._predict_curve_anchors(split)
@@ -1372,16 +1363,14 @@ class ScalarPredictorPipeline:
                 torch.from_numpy(anchors_norm.astype(np.float32)),
                 torch.from_numpy(anchors_pred),
                 torch.from_numpy(curves_true),
-                torch.from_numpy(anchors_true),
-                torch.from_numpy(isc_values.astype(np.float32))  # Add TRUE Isc
+                torch.from_numpy(anchors_true)
             )
             model = self.models['ctrl_point_model']
         else:
             ds = torch.utils.data.TensorDataset(
                 torch.from_numpy(X_full),
                 torch.from_numpy(anchors_true),
-                torch.from_numpy(curves_true),
-                torch.from_numpy(isc_values.astype(np.float32))  # Add TRUE Isc
+                torch.from_numpy(curves_true)
             )
             model = self.models['curve_model']
 
@@ -1420,28 +1409,25 @@ class ScalarPredictorPipeline:
         with torch.no_grad():
             for batch in loader:
                 if use_ctrl_point_model:
-                    batch_x, batch_anchors_norm, batch_anchors, batch_curves, batch_anchors_true, batch_isc = batch
+                    batch_x, batch_anchors_norm, batch_anchors, batch_curves, batch_anchors_true = batch
                     batch_x = batch_x.to(self.device)
                     batch_anchors_norm = batch_anchors_norm.to(self.device)
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
                     batch_anchors_true = batch_anchors_true.to(self.device)
-                    batch_isc = batch_isc.to(self.device)
 
-                    # ControlPointNet: uses predicted anchors but TRUE Isc for normalization
+                    # ControlPointNet: uses predicted anchors
                     ctrl1, ctrl2 = model(batch_x, batch_anchors_norm)
                     pred_anchors = batch_anchors  # Predicted anchors
                     pred_curve_norm = reconstruct_curve_normalized(
-                        batch_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True,
-                        isc=batch_isc  # Use TRUE Isc for proper normalization
+                        batch_anchors, ctrl1, ctrl2, v_grid, clamp_voc=True
                     )
-                    pred_curve = denormalize_curves_by_isc(pred_curve_norm, batch_isc)
+                    pred_curve = denormalize_curves_by_isc(pred_curve_norm, pred_anchors[:, 0])
                 else:
-                    batch_x, batch_anchors, batch_curves, batch_isc = batch
+                    batch_x, batch_anchors, batch_curves = batch
                     batch_x = batch_x.to(self.device)
                     batch_anchors = batch_anchors.to(self.device)
                     batch_curves = batch_curves.to(self.device)
-                    batch_isc = batch_isc.to(self.device)
                     batch_anchors_true = batch_anchors
 
                     # Legacy model: predicts anchors + control points
@@ -1490,16 +1476,13 @@ class ScalarPredictorPipeline:
                 # Compare PCHIP vs piecewise-linear interpolation using the SAME knots.
                 # Evaluate in normalized space when using ControlPointNet.
                 if use_ctrl_point_model:
-                    # Use TRUE Isc for normalization to match reconstruction
-                    anchors_norm = normalize_anchors_by_isc(pred_anchors, batch_isc)
+                    anchors_norm = normalize_anchors_by_jsc(pred_anchors)
                     v1k, j1k, v2k, j2k = build_knots(anchors_norm, ctrl1, ctrl2, j_end=-1.0)
                     j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
                     j2_lin = linear_interpolate_batch(v2k, j2k, v_grid)
-                    # Use absolute Vmpp for masking (it's not normalized)
-                    mask = v_grid.unsqueeze(0) <= pred_anchors[:, 2].unsqueeze(1)
+                    mask = v_grid.unsqueeze(0) <= anchors_norm[:, 2].unsqueeze(1)
                     curve_lin = torch.where(mask, j1_lin, j2_lin)
-                    # Use absolute Voc for clamping (it's not normalized)
-                    v_oc_1d = pred_anchors[:, 1]
+                    v_oc_1d = anchors_norm[:, 1]
                     curve_lin = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), -1.0, curve_lin)
                     delta = pred_curve_norm - curve_lin
                 else:
