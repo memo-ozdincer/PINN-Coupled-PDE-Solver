@@ -35,7 +35,7 @@ from models.vmpp_lgbm import (
     VmppLGBMConfig, VmppLGBM, JmppLGBM, FFLGBM,
     build_vmpp_model, build_jmpp_model, build_ff_model
 )
-from models.reconstruction import reconstruct_curve, continuity_loss
+from models.reconstruction import reconstruct_curve, continuity_loss, build_knots, pchip_interpolate_batch, linear_interpolate_batch
 from hpo import HPOConfig, DistributedHPO, run_full_hpo, get_best_configs_from_study, run_curve_hpo
 from logging_utils import (
     TrainingLogger, ModelComparisonMetrics,
@@ -582,9 +582,13 @@ class ScalarPredictorPipeline:
         X_val_full = np.hstack([val['X_raw'], val['X_physics']])
 
         # CRITICAL: Standardize features AND targets to prevent gradient explosion
-        # Store normalization params for inference
-        self.voc_feature_mean = X_train_full.mean(axis=0, keepdims=True)
-        self.voc_feature_std = X_train_full.std(axis=0, keepdims=True) + 1e-8
+        # Store normalization params for inference.
+        # Use robust scaling (median / IQR) for heavy-tailed physics features.
+        self.voc_feature_mean = np.median(X_train_full, axis=0, keepdims=True)
+        q75 = np.percentile(X_train_full, 75, axis=0, keepdims=True)
+        q25 = np.percentile(X_train_full, 25, axis=0, keepdims=True)
+        self.voc_feature_std = (q75 - q25)
+        self.voc_feature_std[self.voc_feature_std < 1e-8] = 1.0
         X_train_full = (X_train_full - self.voc_feature_mean) / self.voc_feature_std
         X_val_full = (X_val_full - self.voc_feature_mean) / self.voc_feature_std
 
@@ -687,8 +691,12 @@ class ScalarPredictorPipeline:
         X_train_full = np.hstack([train['X_raw'], train['X_physics']]).astype(np.float32)
         X_val_full = np.hstack([val['X_raw'], val['X_physics']]).astype(np.float32)
 
-        self.curve_feature_mean = X_train_full.mean(axis=0, keepdims=True)
-        self.curve_feature_std = X_train_full.std(axis=0, keepdims=True) + 1e-8
+        # Robust feature scaling for long-tailed engineered features
+        self.curve_feature_mean = np.median(X_train_full, axis=0, keepdims=True)
+        q75 = np.percentile(X_train_full, 75, axis=0, keepdims=True)
+        q25 = np.percentile(X_train_full, 25, axis=0, keepdims=True)
+        self.curve_feature_std = (q75 - q25)
+        self.curve_feature_std[self.curve_feature_std < 1e-8] = 1.0
         X_train_norm = (X_train_full - self.curve_feature_mean) / self.curve_feature_std
         X_val_norm = (X_val_full - self.curve_feature_mean) / self.curve_feature_std
 
@@ -744,25 +752,44 @@ class ScalarPredictorPipeline:
         train_loader = torch.utils.data.DataLoader(train_ds, batch_size=2048, shuffle=True)
         val_loader = torch.utils.data.DataLoader(val_ds, batch_size=2048)
 
-        # ISSUE 2 FIX: Use ControlPointNet that takes anchors as input
+        # Use ControlPointNet that takes anchors as input.
+        # If curve HPO was run, reuse its hyperparameters (otherwise defaults).
+        curve_hpo_cfg = getattr(self, 'best_configs', {}).get('curve_model')
+
+        ctrl_points = self.ctrl_points
+        hidden_dims = [256, 128, 64]
+        dropout = 0.15
+        activation = 'silu'
+        lr = 1e-3
+        weight_decay = 1e-5
+        continuity_weight = self.continuity_weight
+
+        if isinstance(curve_hpo_cfg, dict):
+            ss_cfg = curve_hpo_cfg.get('config')
+            if ss_cfg is not None:
+                hidden_dims = getattr(ss_cfg, 'hidden_dims', hidden_dims) or hidden_dims
+                dropout = float(getattr(ss_cfg, 'dropout', dropout))
+                activation = getattr(ss_cfg, 'activation', activation)
+                ctrl_points = int(getattr(ss_cfg, 'ctrl_points', ctrl_points))
+
+            lr = float(curve_hpo_cfg.get('lr', lr))
+            weight_decay = float(curve_hpo_cfg.get('weight_decay', weight_decay))
+            continuity_weight = float(curve_hpo_cfg.get('continuity_weight', continuity_weight))
+
         config = ControlPointNetConfig(
             input_dim=X_train_norm.shape[1],
             anchor_dim=4,
-            hidden_dims=[256, 128, 64],
-            dropout=0.15,
-            activation='silu',
-            ctrl_points=self.ctrl_points
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            activation=activation,
+            ctrl_points=ctrl_points,
         )
 
         model = ControlPointNet(config).to(self.device)
         curve_loss_fn = CurveLoss(mpp_weight=2.0).to(self.device)
 
         # Simpler optimizer - no learnable loss weights
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=1e-3,
-            weight_decay=1e-5
-        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
 
         v_grid = torch.from_numpy(self.v_grid).float().to(self.device)
@@ -775,7 +802,7 @@ class ScalarPredictorPipeline:
         print(f"\nTraining ControlPointNet with:")
         print(f"  ctrl_points: {config.ctrl_points}")
         print(f"  hidden_dims: {config.hidden_dims}")
-        print(f"  continuity_weight: {self.continuity_weight}")
+        print(f"  continuity_weight: {continuity_weight}")
         print(f"  Using ground truth anchors (not re-learning them)")
 
         for epoch in range(150):
@@ -810,7 +837,7 @@ class ScalarPredictorPipeline:
 
                 # Add continuity penalty
                 cont_loss = continuity_loss(batch_anchors_raw, ctrl1, ctrl2, v_grid)
-                loss = loss + self.continuity_weight * cont_loss
+                loss = loss + continuity_weight * cont_loss
 
                 if torch.isnan(loss):
                     continue
@@ -1213,6 +1240,27 @@ class ScalarPredictorPipeline:
                 violations['jmpp_invalid'] += ((pred_anchors[:, 3] <= 0) | (pred_anchors[:, 3] >= pred_anchors[:, 0])).sum().item()
                 violations['j_exceeds_jsc'] += (pred_curve > pred_anchors[:, 0].unsqueeze(1) + 1e-3).sum().item()
 
+                # Reconstruction-layer sanity metric:
+                # Compare PCHIP vs piecewise-linear interpolation using the SAME knots.
+                # If this is huge, the spline layer may be causing overshoot/instability.
+                v1k, j1k, v2k, j2k = build_knots(pred_anchors, ctrl1, ctrl2)
+                j1_lin = linear_interpolate_batch(v1k, j1k, v_grid)
+                j2_lin = linear_interpolate_batch(v2k, j2k, v_grid)
+                mask = v_grid.unsqueeze(0) <= pred_anchors[:, 2].unsqueeze(1)
+                curve_lin = torch.where(mask, j1_lin, j2_lin)
+                if True:
+                    v_oc_1d = pred_anchors[:, 1]
+                    curve_lin = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), torch.zeros_like(curve_lin), curve_lin)
+
+                delta = pred_curve - curve_lin
+                if 'pchip_linear_sum_sq' not in locals():
+                    pchip_linear_sum_sq = 0.0
+                    pchip_linear_sum_cnt = 0
+                    pchip_linear_max_abs = 0.0
+                pchip_linear_sum_sq += (delta ** 2).sum().item()
+                pchip_linear_sum_cnt += delta.numel()
+                pchip_linear_max_abs = max(pchip_linear_max_abs, delta.abs().max().item())
+
         elapsed_time = time.time() - start_time
         n_samples = max(1, len(split['X_raw']))
         inference_time_ms = (elapsed_time / n_samples) * 1000
@@ -1227,7 +1275,11 @@ class ScalarPredictorPipeline:
             'mae_jmpp': jmpp_mae / n_samples,
             'mape_ff': (ff_mape_sum / max(1.0, ff_cnt)) * 100,
             'constraint_violations': violations,
-            'inference_time_ms': inference_time_ms
+            'inference_time_ms': inference_time_ms,
+            # PCHIP reconstruction sanity (independent of ground truth):
+            # how different the PCHIP curve is from linear interpolation given same knots.
+            'pchip_vs_linear_mse': (pchip_linear_sum_sq / max(1, pchip_linear_sum_cnt)) if 'pchip_linear_sum_sq' in locals() else 0.0,
+            'pchip_vs_linear_max_abs': pchip_linear_max_abs if 'pchip_linear_sum_sq' in locals() else 0.0,
         }
 
         # Log to structured logger for comparison table
@@ -1528,7 +1580,8 @@ class ScalarPredictorPipeline:
         self.metrics['pce'] = self._compute_metrics(test['targets']['PCE'], pce_pred, 'PCE')
 
         # Curve model metrics (if trained)
-        if 'curve_model' in self.models:
+        # Robust: curve training may register either key depending on version.
+        if 'curve_model' in self.models or 'ctrl_point_model' in self.models:
             self.metrics['curve'] = self.evaluate_curve_model(split_name='test')
 
         # CVAE baseline metrics (if trained)

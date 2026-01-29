@@ -474,7 +474,8 @@ def get_feature_names() -> list[str]:
         'Eg', 'V_bi', 'Eg_offset', 'Eg_HTL', 'Eg_ETL', 'chiPh', 'chiPe',
         # Interface barriers
         'VBO_HP', 'VBO_PE', 'CBO_HP', 'CBO_PE',
-        'Barrier_h_ETL', 'Barrier_e_ETL',
+        # (name fix) second barrier is electron blocking at HTL
+        'Barrier_h_ETL', 'Barrier_e_HTL',
         'Barrier_anode', 'Barrier_cathode', 'Barrier_asymmetry',
         # Transport - diffusion
         'L_diff_e_log', 'L_diff_h_log', 'L_diff_min_log', 'L_diff_max_log',

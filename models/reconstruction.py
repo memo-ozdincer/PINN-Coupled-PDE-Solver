@@ -200,6 +200,38 @@ def pchip_interpolate_batch(
     return y_eval
 
 
+def linear_interpolate_batch(
+    x_knots: torch.Tensor,
+    y_knots: torch.Tensor,
+    x_eval: torch.Tensor
+) -> torch.Tensor:
+    """
+    Batch piecewise-linear interpolation matching `pchip_interpolate_batch` API.
+
+    Args:
+        x_knots: (N, K) sorted knot locations
+        y_knots: (N, K) knot values
+        x_eval: (M,) evaluation points
+
+    Returns:
+        y_eval: (N, M) linearly interpolated values
+    """
+    batch, k = x_knots.shape
+    n_eval = x_eval.numel()
+
+    x_eval_batch = x_eval.unsqueeze(0).expand(batch, n_eval)
+    idx = torch.searchsorted(x_knots, x_eval_batch, right=False) - 1
+    idx = idx.clamp(0, k - 2)
+
+    x0 = torch.gather(x_knots, 1, idx)
+    x1 = torch.gather(x_knots, 1, idx + 1)
+    y0 = torch.gather(y_knots, 1, idx)
+    y1 = torch.gather(y_knots, 1, idx + 1)
+
+    t = (x_eval_batch - x0) / (x1 - x0 + 1e-12)
+    return y0 + t * (y1 - y0)
+
+
 def reconstruct_curve(
     anchors: torch.Tensor,
     ctrl1: torch.Tensor,
@@ -226,13 +258,15 @@ def reconstruct_curve(
     j1 = pchip_interpolate_batch(v1_knots, j1_knots, v_grid)
     j2 = pchip_interpolate_batch(v2_knots, j2_knots, v_grid)
 
-    v_mpp = anchors[:, 2].unsqueeze(1)
-    mask = v_grid.unsqueeze(0) <= v_mpp
+    # IMPORTANT: keep per-sample voltages 1D for indexing.
+    # Using (N, 1) here causes broadcasting in advanced indexing below.
+    v_mpp_1d = anchors[:, 2]
+    mask = v_grid.unsqueeze(0) <= v_mpp_1d.unsqueeze(1)
     j_curve = torch.where(mask, j1, j2)
 
     if clamp_voc:
-        v_oc = anchors[:, 1].unsqueeze(1)
-        j_curve = torch.where(v_grid.unsqueeze(0) > v_oc, torch.zeros_like(j_curve), j_curve)
+        v_oc_1d = anchors[:, 1]
+        j_curve = torch.where(v_grid.unsqueeze(0) > v_oc_1d.unsqueeze(1), torch.zeros_like(j_curve), j_curve)
         j_curve = torch.where(v_grid.unsqueeze(0) < 0, torch.zeros_like(j_curve), j_curve)
 
     # CRITICAL: Replace any NaN values with interpolated fallback to prevent loss explosion
@@ -247,16 +281,15 @@ def reconstruct_curve(
     batch_idx = torch.arange(j_curve.shape[0], device=j_curve.device)
     j_curve[batch_idx, 0] = anchors[:, 0]
 
-    idx_vmpp = torch.searchsorted(v_grid, v_mpp, right=False)
-    idx_vmpp = idx_vmpp.clamp(max=v_grid.numel() - 1)
+    # Enforce exact knot at Vmpp (1D indexing!)
+    idx_vmpp = torch.searchsorted(v_grid, v_mpp_1d, right=False).clamp(max=v_grid.numel() - 1)
     j_curve[batch_idx, idx_vmpp] = anchors[:, 3]
 
     if clamp_voc:
-        v_oc = anchors[:, 1].unsqueeze(1)
-        idx_cut = torch.searchsorted(v_grid, v_oc, right=False)
-        idx_cut = idx_cut.clamp(max=v_grid.numel() - 1)
+        v_oc_1d = anchors[:, 1]
+        idx_cut = torch.searchsorted(v_grid, v_oc_1d, right=False).clamp(max=v_grid.numel() - 1)
         v_cut = v_grid[idx_cut]
-        mask_cut = v_grid.unsqueeze(0) >= v_cut
+        mask_cut = v_grid.unsqueeze(0) >= v_cut.unsqueeze(1)
         j_curve = torch.where(mask_cut, torch.zeros_like(j_curve), j_curve)
         j_curve[batch_idx, idx_cut] = 0.0
 

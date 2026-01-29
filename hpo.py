@@ -641,9 +641,13 @@ def run_full_hpo(
     X_train_full = np.hstack([X_train_raw, X_train_physics])
     X_val_full = np.hstack([X_val_raw, X_val_physics])
 
-    # CRITICAL: Standardize features for neural network to prevent gradient explosion
-    feature_mean = X_train_full.mean(axis=0, keepdims=True)
-    feature_std = X_train_full.std(axis=0, keepdims=True) + 1e-8
+    # IMPORTANT: Use the same normalization regime as training.
+    # Robust scaling (median/IQR) behaves better with long-tailed physics features.
+    feature_mean = np.median(X_train_full, axis=0, keepdims=True)
+    q75 = np.percentile(X_train_full, 75, axis=0, keepdims=True)
+    q25 = np.percentile(X_train_full, 25, axis=0, keepdims=True)
+    feature_std = (q75 - q25)
+    feature_std[feature_std < 1e-8] = 1.0
     X_train_full = (X_train_full - feature_mean) / feature_std
     X_val_full = (X_val_full - feature_mean) / feature_std
 
@@ -893,9 +897,12 @@ def run_curve_hpo(
     hpo_config = hpo_config or HPOConfig()
     engine = DistributedHPO(hpo_config)
 
-    # Normalize features
-    feature_mean = X_train.mean(axis=0, keepdims=True)
-    feature_std = X_train.std(axis=0, keepdims=True) + 1e-8
+    # Normalize features (match train.py: robust median/IQR scaling)
+    feature_mean = np.median(X_train, axis=0, keepdims=True)
+    q75 = np.percentile(X_train, 75, axis=0, keepdims=True)
+    q25 = np.percentile(X_train, 25, axis=0, keepdims=True)
+    feature_std = (q75 - q25)
+    feature_std[feature_std < 1e-8] = 1.0
     X_train_norm = (X_train - feature_mean) / feature_std
     X_val_norm = (X_val - feature_mean) / feature_std
 
