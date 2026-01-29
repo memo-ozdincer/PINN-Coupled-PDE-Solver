@@ -163,7 +163,11 @@ class PVDataPreprocessor:
             transformed: (N, 31) transformed parameters in [-1, 1]
         """
         self.fitted = True
-        return self.param_transformer.fit_transform(params)
+        params_in = params
+        if isinstance(params, np.ndarray):
+            import pandas as pd
+            params_in = pd.DataFrame(params, columns=self.colnames)
+        return self.param_transformer.fit_transform(params_in)
 
     def transform_params(self, params: np.ndarray) -> np.ndarray:
         """
@@ -177,7 +181,11 @@ class PVDataPreprocessor:
         """
         if not self.fitted:
             raise ValueError("Must call fit_transform_params first")
-        return self.param_transformer.transform(params)
+        params_in = params
+        if isinstance(params, np.ndarray):
+            import pandas as pd
+            params_in = pd.DataFrame(params, columns=self.colnames)
+        return self.param_transformer.transform(params_in)
 
     def fit_transform_curves(self, curves: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
