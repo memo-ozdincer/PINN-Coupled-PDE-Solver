@@ -1114,7 +1114,7 @@ class ScalarPredictorPipeline:
         anchors[:, 0] = np.maximum(anchors[:, 0], eps)
 
         # 2. Voc must be positive and reasonable (< 2V for solar cells)
-        anchors[:, 1] = np.clip(anchors[:, 1], eps, 2.0)
+        anchors[:, 1] = np.clip(anchors[:, 1], eps, 1.4)
 
         # 3. Vmpp must be in (0, Voc)
         anchors[:, 2] = np.clip(anchors[:, 2], eps, anchors[:, 1] - eps)
