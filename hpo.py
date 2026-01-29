@@ -259,6 +259,36 @@ def sample_lgbm_config(trial: optuna.Trial, model_type: str = 'jsc') -> dict:
     return params
 
 
+def default_lgbm_config(model_type: str = 'jsc') -> dict:
+    """Deterministic fallback config when no trials complete."""
+    return {
+        'objective': 'regression',
+        'metric': ['rmse', 'mae'],
+        'boosting_type': 'gbdt',
+        'device': 'gpu',
+        'gpu_platform_id': 0,
+        'gpu_device_id': 0,
+        'verbose': -1,
+        'force_col_wise': True,
+        'num_leaves': 63,
+        'max_depth': 8,
+        'min_child_samples': 20,
+        'min_child_weight': 1e-2,
+        'learning_rate': 0.05,
+        'n_estimators': 1000,
+        'subsample': 0.8,
+        'subsample_freq': 1,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 1e-3,
+        'reg_lambda': 1e-3,
+        'min_split_gain': 0.0,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 1,
+        'path_smooth': 0.0,
+    }
+
+
 class LGBMObjective:
     """Generic Optuna objective for LGBM models."""
 
@@ -575,6 +605,22 @@ class DistributedHPO:
             show_progress_bar=True,
             gc_after_trial=True
         )
+
+        completed_trials = [
+            trial for trial in study.trials
+            if trial.state == optuna.trial.TrialState.COMPLETE
+        ]
+        if not completed_trials:
+            fallback_params = default_lgbm_config(model_name)
+            state_counts = {}
+            for trial in study.trials:
+                state = trial.state.name
+                state_counts[state] = state_counts.get(state, 0) + 1
+            print(
+                f"[WARN] No completed {model_name} LGBM trials. "
+                f"Falling back to default params. Trial states: {state_counts}"
+            )
+            return fallback_params, study
 
         return study.best_params, study
 

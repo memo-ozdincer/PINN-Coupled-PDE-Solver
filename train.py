@@ -526,10 +526,18 @@ class ScalarPredictorPipeline:
         hpo_summary = {}
         for name, result in self.hpo_results.items():
             if 'study' in result:
+                best_value = None
+                n_trials = None
+                if result['study'] is not None:
+                    try:
+                        best_value = result['study'].best_value
+                    except ValueError:
+                        best_value = None
+                    n_trials = len(result['study'].trials)
                 hpo_summary[name] = {
                     'best_params': result['params'],
-                    'best_value': result['study'].best_value,
-                    'n_trials': len(result['study'].trials)
+                    'best_value': best_value,
+                    'n_trials': n_trials
                 }
             else:
                 # Already in summary format (loaded from file or curve HPO)

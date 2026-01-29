@@ -64,9 +64,14 @@ def compute_all_physics_features(params: torch.Tensor) -> torch.Tensor:
     epsP = params[:, COL_IDX['epsP']]
     epsE = params[:, COL_IDX['epsE']]
 
-    # Generation rate (log10 scale in input) -> convert to linear
-    Gavg_log = params[:, COL_IDX['Gavg']]  # Keep log version directly from input
-    Gavg = 10 ** Gavg_log  # m⁻³s⁻¹ (generation rate)
+    # Generation rate may be log10 or linear; detect scale
+    Gavg_raw = params[:, COL_IDX['Gavg']]
+    if torch.max(torch.abs(Gavg_raw)) > 100:
+        Gavg = Gavg_raw  # already linear
+        Gavg_log = torch.log10(Gavg_raw.clamp(min=1e-30))
+    else:
+        Gavg_log = Gavg_raw
+        Gavg = 10 ** Gavg_log  # m⁻³s⁻¹ (generation rate)
 
     # Recombination coefficients (log10 scale in input) -> convert to linear
     Aug_log = params[:, COL_IDX['Aug']]
@@ -514,12 +519,20 @@ def compute_jsc_ceiling(params: torch.Tensor) -> torch.Tensor:
     Compute analytical ceiling for Jsc (before losses).
     J_ceiling = q * G_avg * L_P
 
-    Gavg is in log10 scale in input, convert to linear.
+    Gavg may be provided in log10 or linear scale. Detect and handle both.
     """
     Q_E = 1.602e-19
     lP_m = params[:, COL_IDX['lP']] * 1e-9
-    Gavg = 10 ** params[:, COL_IDX['Gavg']]  # log10 -> linear
-    return Q_E * Gavg * lP_m
+    Gavg_raw = params[:, COL_IDX['Gavg']]
+
+    # If values are already linear, they will be huge (> 1e2). Otherwise log10.
+    if torch.max(torch.abs(Gavg_raw)) > 100:
+        Gavg = Gavg_raw
+    else:
+        Gavg = 10 ** Gavg_raw
+
+    jsc_ceiling = Q_E * Gavg * lP_m
+    return torch.clamp(jsc_ceiling, min=1e-30)
 
 
 def compute_voc_ceiling(params: torch.Tensor) -> torch.Tensor:
