@@ -51,8 +51,8 @@ mkdir -p "$OUT_DIR/models"
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-HPO_TRIALS_LGBM=50
-HPO_TIMEOUT=3600
+export HPO_TRIALS_LGBM=50
+export HPO_TIMEOUT=3600
 
 echo "Running Voc LGBM training..."
 echo "Output directory: $OUT_DIR"
@@ -64,11 +64,12 @@ echo ""
 # - Voc LGBM uses physics features + Voc ceiling ratio target.
 # - Jacobian regularization applies to Voc NN only (not LGBM).
 
-python - <<'PY'
+python - <<PY
 import json
 from pathlib import Path
 import numpy as np
 import torch
+import os
 
 from config import COLNAMES, RANDOM_SEED, VAL_SPLIT, TEST_SPLIT
 from data import load_raw_data, prepare_tensors, extract_targets_gpu, split_indices
@@ -111,8 +112,8 @@ voc_val = targets_np["Voc"][val_idx]
 
 # HPO for Voc LGBM
 hpo_config = HPOConfig(
-    n_trials_lgbm=int(r"${HPO_TRIALS_LGBM}"),
-    timeout_per_model=int(r"${HPO_TIMEOUT}"),
+    n_trials_lgbm=int(os.environ["HPO_TRIALS_LGBM"]),
+    timeout_per_model=int(os.environ["HPO_TIMEOUT"]),
 )
 engine = DistributedHPO(hpo_config)
 

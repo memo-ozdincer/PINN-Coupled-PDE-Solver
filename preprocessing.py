@@ -123,7 +123,10 @@ def get_param_transformer(colnames: list[str] = None) -> ColumnTransformer:
 
         # Add log1p for material properties (they span many orders of magnitude)
         if group == 'material_properties':
-            steps.insert(0, ('log1p', FunctionTransformer(func=np.log1p, inverse_func=np.expm1)))
+            steps.insert(
+                0,
+                ('log1p', FunctionTransformer(func=np.log1p, inverse_func=np.expm1, check_inverse=False))
+            )
 
         transformers.append((group, Pipeline(steps), actual_cols))
 
